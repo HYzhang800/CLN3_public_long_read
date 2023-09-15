@@ -1,0 +1,1957 @@
+---
+title: "Long-read data processing for CLN3"
+output: html_notebook
+---
+```{r}
+library(dplyr)
+
+meta_tsv <- list.files(path = "E:/Encode_tsv/Metadata/", full.names = TRUE)
+metadata <- lapply(meta_tsv, function(file) {
+  meta <- read.table(file, sep = '\t', header = TRUE)
+  meta$organ <- gsub(".tsv", "", basename(file))
+  meta
+})
+
+metadata_tsv <- bind_rows(metadata)
+
+# Filter for "released" samples and remove "RNA" libraries
+metadata_tsv <- metadata_tsv %>%
+  filter(File.analysis.status == "released" & Library.made.from != "RNA")
+
+sample_size <- length(unique(metadata_tsv$File.accession))
+
+quanti_tissue <- metadata_tsv %>%
+  dplyr::select(File.accession, Experiment.accession, Biosample.term.name, organ)
+
+quanti_tissue$organ <- gsub(".tsv", "", quanti_tissue$organ)
+
+organ_info <- quanti_tissue %>%
+  dplyr::select(Biosample.term.name, organ) %>%
+  unique()
+
+```
+
+
+```{r}
+suppressPackageStartupMessages({
+  library(ORFik)
+  library(GenomicFeatures)
+  library(data.table)
+  library(Biostrings)
+  library(GenomicRanges)
+  library(tidyverse)
+  library(tidyr)
+  library(rtracklayer)
+})
+
+setwd("F:/Data/Encode_annotation/all/")
+
+
+files <- list.files(path = "F:/Data/Encode_annotation/all/")
+
+annotation <- grep("CLN3*", files, value = TRUE)
+
+f <- list()
+
+
+for (i in 1:length(annotation)) {
+  gtf <- rtracklayer::import(annotation[i]) %>% as_tibble()
+  f[[i]] <- gtf
+}
+
+
+gtf <- bind_rows(f)
+
+# keep unique 'exons'
+gtf <- gtf %>% filter(type == "exon") %>% unique()
+
+
+# rank exons for each transcripts from 5' to 3'
+
+gtf <- gtf %>% group_by(transcript_id) %>% group_split()
+
+for (i in 1:length(gtf)){
+  gtf[[i]] <- gtf[[i]][order(-gtf[[i]]$start),] 
+}
+
+gtf_tibble <- bind_rows(gtf)
+
+gtf_tibble <- gtf_tibble %>% group_by(transcript_id) %>% mutate(exon_number = row_number())
+
+
+#export(gtf_tibble,"E:/Encode_annotation/all/CLN3_locus_unique_exons_ranked.gtf", format="gtf")
+
+
+
+# Separate CLN3 and fusion transcripts by coordinates
+
+
+
+gff <- rtracklayer::import("E:/Encode_annotation/all/CLN3_locus_exons_ranked_transcriptinfo.gff3") #obtained using gffread
+gtf_trans <- gff[elementMetadata(gff)[, "type"] == "transcript"]
+
+
+
+# NPIPB7 locus
+region <- GRanges(
+  seqnames = "chr16",
+  #ranges = IRanges(start = 28456329, end = 28472336),   #ensembl 109
+  ranges = IRanges(start = 28456372, end = 28471175),    
+  strand = Rle(strand("-"))
+)
+
+# CLN3 locus
+cln3_region <- GRanges(
+  seqnames = "chr16",
+  ranges = IRanges(start = 28474111, end = 28495575),
+  strand = Rle(strand("-"))
+)
+
+
+#transcripts overlapping with both CLN3 locus and NPIPB7 locs are considered as transcripts from the readthrough gene
+fusion_trans <- subsetByOverlaps(gtf_trans, region) 
+
+fusion_id <- unique(fusion_trans$ID)
+
+#cln3_trans <- subsetByOverlaps(gtf_trans, cln3_region, type = "within")
+cln3_trans <- gtf_trans[!(elementMetadata(gtf_trans)[, "ID"] %in% fusion_id)]
+
+
+gtf_tibble <- rtracklayer::import("E:/Encode_annotation/all/CLN3_locus_unique_exons_ranked.gtf") %>% as_tibble()
+gtf_tibble_cln3 <- gtf_tibble %>% filter(transcript_id %in% cln3_trans$ID)
+#export(gtf_tibble_cln3, "E:/Encode_annotation/all/locus_CLN3_exons_ranked_raw.gtf", format = "gtf")
+
+gtf_tibble_fusion <- gtf_tibble %>% filter(transcript_id %in% fusion_id)
+#export(gtf_tibble_fusion, "E:/Encode_annotation/all/locus_fusion_exons_ranked_raw.gtf", format = "gtf")
+
+
+```
+
+
+```{r}
+###################################
+
+# Read CLN3 GTF file
+gtf <- rtracklayer::import("E:/Encode_annotation/all/locus_CLN3_exons_ranked_raw.gtf")
+gtf_tibble <- gtf %>% as_tibble()
+
+
+#mis <- gtf_tibble %>% dplyr::select(transcript_id, gene_name) %>% unique()
+#2098 TALON transcripts, 1113 were annotated to the readthrough gene
+
+
+# Set the reference DNA sequence
+ref <- readDNAStringSet("E:/reference_for_APTARS/chr16.fa")
+
+# Create GRangesList from gtf_tibble
+grl <- makeGRangesListFromDataFrame(gtf_tibble, split.field = "transcript_id", names.field = "transcript_id")
+
+# Extract transcript sequences
+seqs <- extractTranscriptSeqs(ref, grl)
+#writeXStringSet(seqs, "E:/Encode_tsv/all/transcript_seq.fa")
+
+
+# Convert the sequences to a data frame
+cln3_seq <- data.frame(
+  annot_transcript_id = names(seqs),
+  transcript_sequence = paste(seqs)
+)
+
+orf_orfik <- findMapORFs(grl, seqs,longestORF = T,minimumLength = 0, startCodon = startDefinition(6), stopCodon = stopDefinition(1),
+                         groupByTx = T) #GRangesList and DNAStringSet have to be in the same order 
+
+orftibble <- as_tibble(orf_orfik)
+orftibble <- unique(orftibble)
+
+orftibble <- orftibble %>% group_by(names) %>% mutate(total_length = rowsum(width, group)) %>% ungroup()
+orftibble <- orftibble %>% separate(names, c('transcript_id', 'n_orf'), sep = '_')
+orftibble$total_length <- as.integer(orftibble$total_length)
+
+
+#select longest ORF for each transcript
+orf_longest <- orftibble %>% group_by(transcript_id) %>% top_n(1,total_length)
+
+
+orf_longest <- unique(orf_longest)
+
+#make gtf structure
+all_cds_gtf <- orf_longest %>% dplyr::select(seqnames:transcript_id)
+
+
+#Used quantified transcripts, so unquantified suspicous transcripts were not included 
+
+
+all_cds_gtf$type <- "CDS"
+
+#cln3_cds_gtf <- cln3_cds_gtf[,c(1,2,3,4,5,7,6)]
+
+
+
+all_cds_gtf <- unique(all_cds_gtf)
+
+
+
+
+whole_gtf <- dplyr::bind_rows(gtf_tibble, all_cds_gtf)
+whole_gtf$gene_name <- "CLN3"
+whole_gtf$gene_id <- "ENSG00000188603.19"
+
+
+talon_id <- whole_gtf$transcript_id %>% unique()
+
+```
+
+
+
+```{r}
+files <- list.files(path = "E:/Encode_tsv/all/")
+quantification <- grep("tsv*", files, value = TRUE)
+
+f <- list()
+
+setwd("E:/Encode_tsv/all/")
+
+#select previously identified CLN3 transcripts and calculate their usage
+for (i in 1:length(quantification)) {
+  f[[i]] <- read.table(quantification[i], sep = '\t', header = TRUE)
+  f[[i]] <- f[[i]] %>% filter(annot_transcript_id %in% talon_id) %>%
+    filter(transcript_novelty != "Genomic")  #remoce Genomic transcripts
+  
+  if (nrow(f[[i]]) != 0) {
+    f[[i]]$sample <- colnames(f[[i]])[12]
+    colnames(f[[i]])[12] <- 'TPM'
+    f[[i]]$proportion <- f[[i]]$TPM / sum(f[[i]]$TPM)
+    colnames(f[[i]])[14] <- paste('proportion', f[[i]]$sample[1])
+    f[[i]]$file <- quantification[i]
+  }
+}
+
+quanti_info <- bind_rows(f)
+quanti_info[is.na(quanti_info)] <- 0
+quanti_info$file <- gsub(".tsv", "", as.character(quanti_info$file))
+
+# Add tissue information from quanti_tissue data frame
+quanti_info$tissue <- quanti_tissue$Biosample.term.name[match(quanti_info$file, quanti_tissue$File.accession)]
+
+# Add organ information from quanti_tissue data frame
+quanti_info$organ <- quanti_tissue$organ[match(quanti_info$file, quanti_tissue$File.accession)]
+
+
+#write.csv(quanti_info,file = "E:/Encode_tsv/all/locus_CLN3_only.csv",row.names = F)
+
+
+quanti_info <- read.csv(file = "E:/Encode_tsv/all/locus_CLN3_only.csv")
+
+sample_depth <- quanti_info %>%
+  dplyr::select(sample, TPM) %>%
+  group_by(sample) %>%
+  summarise(across(TPM, sum))
+
+sample_depth <- separate(sample_depth, sample, into = c("replica", "Experiment.accession"), sep = "(?=[E][N])", remove = FALSE, fill = "right")
+
+sample_depth$Biosample.term.name <- quanti_tissue$Biosample.term.name[match(sample_depth$Experiment.accession, quanti_tissue$Experiment.accession)]
+
+organs <- unique(quanti_tissue$organ)
+organ_depth <- list()
+
+
+#make separate rows for same tissues in different organs
+for (i in 1:length(organs)) {
+  tissues <- quanti_tissue %>% filter(organ == organs[i])
+  df <- sample_depth %>% dplyr::filter(Biosample.term.name %in% tissues$Biosample.term.name)
+  df$organ <- organs[i]
+  organ_depth[[i]] <- df
+}
+
+sample_depth <- bind_rows(organ_depth)
+
+#summarise CLN3 TPM for each organ
+sample_info <- sample_depth %>%
+  group_by(organ) %>%
+  summarize(
+    TPM_mean = mean(TPM),
+    TPM_median = median(TPM),
+    TPM_max = max(TPM),
+    TPM_min = min(TPM),
+    num_samples = n(),
+    tissues = paste(unique(Biosample.term.name), collapse = ', ')
+  )
+
+sample_info <- sample_info %>% 
+  dplyr::select(
+    organs = organ,
+    num_samples,
+    tissues,
+    TPM_mean,
+    TPM_min,
+    TPM_median,
+    TPM_max
+  )
+
+sample_info
+
+#write.csv(sample_info, "C:/Users/Haoyu/Desktop/output/manuscript/Tables/CLN3_TPM_summary_in_organs.csv", row.names = F)
+
+```
+
+Check TPM for each organs for the readthrough gene
+```{r}
+sample_depth_cln3 <- sample_depth
+sample_depth_cln3$gene <- "CLN3"
+
+quanti_info_fusion <- read.csv(file = "E:/Encode_tsv/all/locus_fusion_only.csv")
+
+sample_depth_fusion <- quanti_info_fusion %>%
+  dplyr::select(sample, TPM) %>%
+  group_by(sample) %>%
+  summarise(across(TPM, sum))
+
+sample_depth_fusion <- separate(sample_depth_fusion, sample, into = c("replica", "Experiment.accession"), sep = "(?=[E][N])", remove = FALSE, fill = "right")
+
+sample_depth_fusion$Biosample.term.name <- quanti_tissue$Biosample.term.name[match(sample_depth_fusion$Experiment.accession, quanti_tissue$Experiment.accession)]
+
+organs <- unique(quanti_tissue$organ)
+organ_depth <- list()
+
+
+#make separate rows for same tissues in different organs
+for (i in 1:length(organs)) {
+  tissues <- quanti_tissue %>% filter(organ == organs[i])
+  df <- sample_depth_fusion %>% dplyr::filter(Biosample.term.name %in% tissues$Biosample.term.name)
+  df$organ <- organs[i]
+  organ_depth[[i]] <- df
+}
+
+sample_depth_fusion <- bind_rows(organ_depth)
+
+sample_depth_fusion$gene <- "CLN3_readthrough"
+
+
+sample_info_fusion <- sample_depth_fusion %>%
+  group_by(organ) %>%
+  summarize(
+    TPM_mean = mean(TPM),
+    TPM_median = median(TPM),
+    TPM_max = max(TPM),
+    TPM_min = min(TPM),
+    num_samples = n(),
+    tissues = paste(unique(Biosample.term.name), collapse = ', ')
+  )
+
+sample_info_fusion <- sample_info_fusion %>% 
+  dplyr::select(
+    organs = organ,
+    num_samples,
+    #tissues,
+    TPM_mean,
+    TPM_min,
+    TPM_median,
+    TPM_max
+  )
+
+sample_info_fusion
+#write.csv(sample_info_fusion, "C:/Users/Haoyu/Desktop/output/manuscript/Tables/fusion_TPM_summary_in_organs.csv", row.names = F)
+```
+
+
+```{r}
+library(GenomicRanges)
+
+#quanti_info <- read.csv(file = "E:/Encode_tsv/all/locus_CLN3_only.csv")
+
+
+# Remove "Genomic" transcripts
+#quanti_info <- quanti_info %>% filter(transcript_novelty != "Genomic")
+
+# Filter whole_gtf to include only transcripts present in quanti_info
+whole_gtf <- whole_gtf %>% filter(transcript_id %in% quanti_info$annot_transcript_id) %>% unique()
+
+#export(whole_gtf, "E:/Encode_annotation/all/CLN3_locus_exon_with_cds.gtf", format = "gtf")
+
+# Get CDS coordinates for each transcript
+cds_coord <- whole_gtf %>% filter(type == "CDS") %>% GRanges()
+
+cds_coord <- split(cds_coord,cds_coord$transcript_id)
+
+# Extract CDS sequences
+cds <- extractTranscriptSeqs(ref, cds_coord)
+
+# Create a data frame with annotated transcript ID and CDS sequence
+cln3_cds <- data.frame(annot_transcript_id = names(cds), cds_sequence = paste(cds))
+#3 TALON transcripts do not have CDSs
+
+
+# Merge quanti_cds with cln3_cds based on annot_transcript_id
+quanti_cds <- quanti_info %>% dplyr::select(-c('TPM', 'sample'))
+#quanti_cds <- merge(quanti_cds, cln3_cds, by = 'annot_transcript_id')
+
+quanti_cds <- left_join(quanti_cds, cln3_cds, by = 'annot_transcript_id')
+
+quanti_cds$cds_sequence <- ifelse(is.na(quanti_cds$cds_sequence), "no", quanti_cds$cds_sequence)
+
+# Retrieve unique CDS sequences and calculate rank and number of amino acids
+cln3_cds <- quanti_cds %>%
+  dplyr::select(cds_sequence) %>%
+  unique() %>%
+  arrange(desc(str_length(cds_sequence))) %>%
+  mutate(rank = 1:n()) %>%
+  mutate(num_aa = ifelse(cds_sequence != "no", (str_length(cds_sequence) - 3) / 3, 0)) %>%
+  mutate(orf_id = ifelse( num_aa != 0, paste0('CLN3_', rank, '_', num_aa, 'aa'),paste0('CLN3_', rank, '_No_ORF') )) %>%
+  dplyr::select(-c('rank', 'num_aa'))
+
+# Merge quanti_cds with cln3_cds based on cds_sequence
+quanti_cds <- merge(quanti_cds, cln3_cds, by = "cds_sequence")
+
+
+#>Three TALON transcripts do not have CDSs: "ENCLB355PRNT000225296" "ENCLB493RCQT000258103" "ENCLB611DPFT000257989"
+#>They were removed when generating quanti_cds, number of transcripts went from 1998 to 1995 after this step
+
+#write.csv(cln3_cds_genomic, "C:/Users/Haoyu/Desktop/output/manuscript/Tables/genomic_transcripts_cds.csv", row.names = F)
+#There are 99 'Genomic' transcripts for locus selected CLN3 transcripts.
+#including known transcripts
+#Their ORFs are not predicted
+# [66] "ENST00000561505.2"     "ENST00000564091.6"     "ENST00000564574.5"     "ENST00000565047.1"     "ENST00000565140.5"    
+# [71] "ENST00000565236.1"     "ENST00000565354.5"     "ENST00000565688.5"     "ENST00000565778.6"     "ENST00000566040.1"    
+# [76] "ENST00000566083.6"     "ENST00000566472.1"     "ENST00000566816.1"     "ENST00000566824.6"     "ENST00000567160.1"    
+# [81] "ENST00000567495.6"     "ENST00000567804.1"     "ENST00000568443.2"     "ENST00000568472.6"     "ENST00000568497.6"    
+# [86] "ENST00000568558.6"     "ENST00000569030.5"     "ENST00000631023.2"     "ENST00000635973.1"     "ENST00000636351.1"    
+# [91] "ENST00000636355.1"     "ENST00000636685.1"     "ENST00000636853.1"     "ENST00000636977.1"     "ENST00000637100.1"    
+# [96] "ENST00000637107.1"     "ENST00000637110.1"     "ENST00000637686.1"     "ENST00000637985.1"    
+
+```
+
+
+Determine transcript novelty using specific version of GENCODE annotation
+```{r}
+library(GenomicFeatures)
+
+
+#annot_gencode <- rtracklayer::import("E:/reference_for_APTARS/gencode.v29.annotation.gtf") %>%
+#  as_tibble() %>%
+#  filter(gene_name %in% quanti_info$annot_gene_name)
+
+#export(annot_gencode, "E:/reference_for_APTARS/cln3_fusion.gencode.v29.gtf", format = "gtf")
+
+
+
+# Import and filter GTF files
+#annot_gencode <- rtracklayer::import("E:/reference_for_APTARS/CLN3_fusion_gencode_35.gtf") %>%
+#  as_tibble() %>%
+#  filter(type == "exon")
+
+annot_gencode <- rtracklayer::import("E:/reference_for_APTARS/cln3_fusion.gencode.v29.gtf") %>%
+  as_tibble() %>%
+  filter(type == "exon")
+
+
+encode_lr <- gtf_tibble
+
+# Create coordinates column
+encode_lr$coordinates <- paste0(encode_lr$start, "-", encode_lr$end)
+annot_gencode$coordinates <- paste0(annot_gencode$start, "-", annot_gencode$end)
+
+# Merge encode and gencode transcripts
+transcripts_whole <- bind_rows(encode_lr, annot_gencode) %>%
+  group_by(coordinates) %>%
+  mutate(exon_id = cur_group_id())
+
+# Assign exon_id to gencode and encode
+annot_gencode$exon_id <- transcripts_whole$exon_id[match(annot_gencode$coordinates, transcripts_whole$coordinates)]
+encode_lr$exon_id <- transcripts_whole$exon_id[match(encode_lr$coordinates, transcripts_whole$coordinates)]
+
+
+encode_list <- encode_lr %>%
+  group_by(transcript_id) %>%
+  group_split()
+
+# Assign IDs to encode transcripts using unique exon IDs
+encode_lr <- bind_rows(lapply(encode_list, function(df) {
+  df$transcript_num <- paste(df$exon_id, collapse = "-")
+  df
+}))
+
+
+annot_gencode_list <- annot_gencode %>%
+  group_by(transcript_id) %>%
+  group_split()
+
+
+annot_gencode <- bind_rows(lapply(annot_gencode_list, function(df) {
+  df$transcript_num <- paste(df$exon_id, collapse = "-")
+  df
+}))
+
+
+encode_lr$transcript_novelty <- ifelse(encode_lr$transcript_num %in% annot_gencode$transcript_num, "Known", "Novel")
+
+# Assign transcript_novelty to quanti_cds
+quanti_cds$transcript_novelty <- encode_lr$transcript_novelty[match(quanti_cds$annot_transcript_id, encode_lr$transcript_id)]
+
+
+
+#> The only different between GENCODE V29 and V35 for CLN3 is ENST00000637551.2 (CLN3-259) in V29
+#> It is detected in 1 sample so will not affect further analysis
+```
+
+UTRs novelty check
+
+```{r}
+# Load necessary libraries
+library(GenomicFeatures)
+
+
+#check the UTRs novelty
+
+
+#txdb_known <- makeTxDbFromGFF("E:/reference_for_APTARS/CLN3_fusion_gencode_35.gtf", format="gtf") #this will take some time
+txdb_known <- makeTxDbFromGFF("E:/reference_for_APTARS/cln3_fusion.gencode.v29.gtf", format="gtf") #this will take some time
+five_known <- fiveUTRsByTranscript(txdb_known, use.names = T)
+three_known <- threeUTRsByTranscript(txdb_known, use.names = T)
+
+
+five_known <- as_tibble(five_known)
+three_known <- as_tibble(three_known)
+
+
+##exon_name in encode dataset and gencode data are not the same !
+
+
+#####make transcript database using un-merged annotation file with 'CDS'
+txdb <- makeTxDbFromGFF("E:/Encode_annotation/all/CLN3_locus_exon_with_cds.gtf", format = "gtf")
+####
+
+
+five_txdb_encode <- fiveUTRsByTranscript(txdb, use.names = T)
+three_txdb_encode <- threeUTRsByTranscript(txdb, use.names = T)
+
+five_UTR <- as_tibble(five_txdb_encode)
+three_UTR <- as_tibble(three_txdb_encode)
+
+
+##check 5utr novelty
+five_UTR$coordinates <- paste0(five_UTR$start,"-",five_UTR$end, sep = "" )
+five_known$coordinates <- paste0(five_known$start,"-",five_known$end, sep= "")
+
+
+five_whole <- bind_rows(five_UTR, five_known)
+
+#assign numeric IDs for each exons
+five_whole <- five_whole %>% 
+  group_by(coordinates) %>% 
+  mutate(exon_id = cur_group_id())
+
+#check which IDs are from known/long-read data
+five_known$exon_id <- five_whole$exon_id[match(five_known$coordinates, five_whole$coordinates)]
+five_UTR$exon_id <- five_whole$exon_id[match(five_UTR$coordinates, five_whole$coordinates)]
+
+
+five_UTR <- five_UTR %>% group_by(group_name) %>% group_split()
+
+#make numeric IDs for each UTR using exon IDs
+five <- list()
+for (i in 1:length(five_UTR)){
+  
+df <- five_UTR[[i]]
+df$five_id <- paste(df$exon_id, collapse = "-")
+
+five[[i]] <- df
+  
+}
+
+
+five <- bind_rows(five)
+
+
+five_known <- five_known %>% group_by(group_name) %>% group_split()
+gencode_five <- list()
+
+for (i in 1:length(five_known)){
+df <- five_known[[i]]
+df$five_id <- paste(df$exon_id, collapse = "-")
+
+gencode_five[[i]] <- df
+  
+}
+
+gencode_five <- bind_rows(gencode_five)
+
+five$five_novelty <- ifelse(five$five_id %in% gencode_five$five_id, "Known", "Novel") 
+
+
+#check novelty for 3utr
+##########################################
+
+three_UTR$coordinates <- paste0(three_UTR$start,"-",three_UTR$end, sep = "" )
+three_known$coordinates <- paste0(three_known$start,"-",three_known$end, sep= "")
+
+
+three_whole <- bind_rows(three_UTR, three_known)
+
+
+
+three_whole <- three_whole %>% group_by(coordinates) %>% mutate(exon_id = cur_group_id())
+
+three_known$exon_id <- three_whole$exon_id[match(three_known$coordinates, three_whole$coordinates)]
+three_UTR$exon_id <- three_whole$exon_id[match(three_UTR$coordinates, three_whole$coordinates)]
+
+three_UTR <- three_UTR %>% group_by(group_name) %>% group_split()
+
+three <- list()
+for (i in 1:length(three_UTR)){
+  
+df <- three_UTR[[i]]
+df$three_id <- paste(df$exon_id, collapse = "-")
+
+three[[i]] <- df
+  
+}
+
+
+three <- bind_rows(three)
+
+
+three_known <- three_known %>% group_by(group_name) %>% group_split()
+gencode_three <- list()
+for (i in 1:length(three_known)){
+  
+df <- three_known[[i]]
+df$three_id <- paste(df$exon_id, collapse = "-")
+
+gencode_three[[i]] <- df
+  
+}
+
+gencode_three <- bind_rows(gencode_three)
+
+three$three_novelty <- ifelse(three$three_id %in% gencode_three$three_id, "Known", "Novel") 
+
+
+
+
+five_novelty <- five %>% dplyr::select(group_name,five_novelty) %>% unique()
+three_novelty <- three %>% dplyr::select(group_name,three_novelty) %>% unique()
+
+```
+
+
+Transcripts collapsing/merging
+```{r}
+five_UTR <- as_tibble(five_txdb_encode)
+three_UTR <- as_tibble(three_txdb_encode)
+
+
+info <- quanti_cds
+
+
+five_UTR$orf_id <- info$orf_id[match(five_UTR$group_name, info$annot_transcript_id)]
+
+# Count the number of exons per UTR
+five_UTR <- five_UTR %>% 
+  group_by(group_name) %>% 
+  mutate(n_5prime_exons = n())
+
+
+five_UTR$coordinates <- paste0(five_UTR$start,'-',five_UTR$end)
+
+five_UTR_list <- five_UTR %>% 
+  group_by(group_name) %>% 
+  group_split()
+
+#Extract first exons and rest exons for each UTR
+first_five <- list()
+rest_five <- list()
+for (i in 1:length(five_UTR_list)){
+  first_five[[i]] <- five_UTR_list[[i]][five_UTR_list[[i]]$exon_rank == min(five_UTR_list[[i]]$exon_rank),]
+  rest_five[[i]] <- five_UTR_list[[i]][five_UTR_list[[i]]$exon_rank != min(five_UTR_list[[i]]$exon_rank),]
+  
+}
+
+
+
+
+first_five_df <- bind_rows(first_five)
+rest_five_df <- bind_rows(rest_five)
+
+
+rest_five_df <- rest_five_df %>% 
+  group_by(coordinates) %>% 
+  mutate(my_exon_id = cur_group_id())
+
+rest_five <- rest_five_df %>% group_by(group_name) %>% group_split()
+
+# Order rest exons by exon_rank and assign rest_id
+five_prime_rest_l <- lapply(rest_five, function(df) {
+  df <- df[order(df$exon_rank), ]
+  my_combined_id <- df$my_exon_id
+  df$rest_id <- paste(my_combined_id, collapse = '_')
+  df
+})
+
+five_prime_rest <- bind_rows(five_prime_rest_l)
+
+five_prime_id <- five_prime_rest %>% ungroup() %>% dplyr::select(group_name, rest_id) %>% unique()
+
+five_UTR$rest_id <- five_prime_id$rest_id[match(five_UTR$group_name, five_prime_id$group_name)]
+
+####
+#assign id for first exon in 5 prime
+
+#add id for 3 prime of first exon
+
+
+five_prime_first <- first_five_df
+five_prime_first$rest_id <- five_prime_id$rest_id[match(five_prime_first$group_name, five_prime_id$group_name)]
+five_prime_first[is.na(five_prime_first)] <- 'no'
+
+five_prime_first <- five_prime_first %>% 
+  group_by(start) %>% 
+  mutate(start_first = cur_group_id())
+
+five_prime_first$first_start_id_rest <- paste0(five_prime_first$start_first,'_',five_prime_first$rest_id) 
+
+
+
+five_prime_first_l <- five_prime_first %>% 
+  group_by(first_start_id_rest) %>% 
+  group_split()
+  
+k = 1
+  
+start_merged_l <- list()
+
+  for (m in 1:length(five_prime_first_l)){
+    df <- five_prime_first_l[[m]]
+    df <- df[order(df$end),]
+    df <- data.frame(df)
+   
+    
+    for (i in 1:nrow(df)){
+      if(i == 1){
+        df$exon_1id[i] <- k
+      } else if (i >1 & df$end[i] < df[df$exon_1id == df$exon_1id[i-1],]$end[1] + 40){
+        df$exon_1id[i] <- k
+        
+      } else if (i >1 & df$end[i] > df[df$exon_1id == df$exon_1id[i-1],]$end[1] + 40 ){   
+        df$exon_1id[i] <- k+1
+        k = k+1
+      } 
+    }
+    start_merged_l[m]<- list(df)
+   k= k+1
+  }
+
+
+
+start_merged <- bind_rows(start_merged_l)
+
+start_merged$five_id <- paste0(start_merged$exon_1id,'_', start_merged$first_start_id_rest)
+
+start_merged <- start_merged %>% 
+  group_by(five_id) %>% 
+  mutate(final_five_id = cur_group_id())
+
+five_id <- start_merged %>% 
+  ungroup() %>% 
+  dplyr::select(group_name, final_five_id) %>%
+  unique() %>%
+  mutate(final_five_id = paste0('5UTR_', final_five_id))
+
+
+
+###########Do the same for 3'UTRs
+
+
+three_UTR$orf_id <- info$orf_id[match(three_UTR$group_name, info$annot_transcript_id)]
+
+three_UTR <- three_UTR %>% 
+  group_by(group_name) %>% 
+  mutate(n_3prime_exons = n())
+
+
+
+three_UTR$coordinates <- paste0(three_UTR$start,'-',three_UTR$end)
+
+
+three_UTR_list <- three_UTR %>% 
+  group_by(group_name) %>% 
+  group_split()
+
+
+#separate the last exons and rest exons
+last_three <- list()
+rest_three <- list()
+for (i in 1:length(three_UTR_list)){
+  last_three[[i]] <- three_UTR_list[[i]][three_UTR_list[[i]]$exon_rank == max(three_UTR_list[[i]]$exon_rank),]
+  rest_three[[i]] <- three_UTR_list[[i]][three_UTR_list[[i]]$exon_rank != max(three_UTR_list[[i]]$exon_rank),]
+  
+}
+
+
+
+
+last_three_df <- bind_rows(last_three)
+rest_three_df <- bind_rows(rest_three)
+
+
+##assign id for exons which are not the 'last' exons then arrange id using exon id, for each transcript
+rest_three_df <- rest_three_df %>% group_by(coordinates) %>% mutate(my_exon_id = cur_group_id())
+
+rest_three <- rest_three_df %>% group_by(group_name) %>% group_split()
+
+
+three_prime_rest_l <- lapply(rest_three, function(df) {
+  df <- df[order(df$exon_rank), ]
+  my_combined_id <- df$my_exon_id
+  df$rest_id <- paste(my_combined_id, collapse = '_')
+  df
+})
+
+
+
+three_prime_rest <- bind_rows(three_prime_rest_l)
+
+three_prime_id <- three_prime_rest %>%
+  ungroup() %>% 
+  dplyr::select(group_name, rest_id) %>% 
+  unique()
+
+three_UTR$rest_id <- three_prime_id$rest_id[match(three_UTR$group_name, three_prime_id$group_name)]
+
+####
+
+#add id for 3 prime of first exon
+
+
+three_prime_last <- last_three_df
+three_prime_last$rest_id <- three_prime_id$rest_id[match(three_prime_last$group_name, three_prime_id$group_name)]
+three_prime_last[is.na(three_prime_last)] <- 'no'
+
+three_prime_last <- three_prime_last %>% 
+  group_by(end) %>% 
+  mutate(end_last = cur_group_id())
+
+three_prime_last$last_end_id_rest <- paste0(three_prime_last$end_last,'_',three_prime_last$rest_id) 
+
+
+
+
+end_merged_l <- list()
+
+k=1 
+
+three_prime_last_l <- three_prime_last %>% group_by(last_end_id_rest) %>% group_split()
+  
+for (m in 1:length(three_prime_last_l)){
+    df <- three_prime_last_l[[m]]
+    df <- df[order(df$start),]
+    df <- data.frame(df)
+   
+    
+    for (i in 1:nrow(df)){
+      if(i == 1){
+        df$exon_1id[i] <- k
+      } else if (i >1 & df$start[i] < df[df$exon_1id == df$exon_1id[i-1],]$start[1] + 40){                  
+        df$exon_1id[i] <- k                                            
+        
+      } else if (i >1 & df$start[i] > df[df$exon_1id == df$exon_1id[i-1],]$start[1] + 40 ){                    
+        df$exon_1id[i] <- k+1
+        k = k+1
+      } 
+      
+    }
+    end_merged_l[m]<- list(df)
+   k= k+1
+  }
+  
+
+
+end_merged <- bind_rows(end_merged_l)
+
+
+
+end_merged$three_id <- paste0(end_merged$last_end_id_rest,'_',end_merged$exon_1id)
+
+end_merged <- end_merged %>% 
+  group_by(three_id) %>% 
+  mutate(final_three_id = cur_group_id())
+
+three_id <- end_merged %>% 
+  ungroup() %>% 
+  dplyr::select(group_name, final_three_id) %>%
+  unique() %>% 
+  mutate(final_three_id = paste0("3UTR_",final_three_id))
+
+
+
+info$three_id <- three_id$final_three_id[match(info$annot_transcript_id, three_id$group_name)]
+info$five_id <- five_id$final_five_id[match(info$annot_transcript_id, five_id$group_name)]    
+    
+    
+info$five_id[is.na(info$five_id)] <- '5UTR_no'
+info$three_id[is.na(info$three_id)] <- '3UTR_no'
+info$new_id <- paste(info$orf_id,'_',info$five_id,'_',info$three_id, sep = "")
+
+#for transcripts with no ORFs, use TALON ID as well to distinguish
+info$new_id <- ifelse(info$orf_id == "CLN3_280_No_ORF", paste0(info$new_id, "_", info$annot_transcript_id, sep= ""), info$new_id)
+
+
+```
+
+```{r}
+# Assign new UTR IDs
+five_novelty$five_id <- info$five_id[match(five_novelty$group_name, info$annot_transcript_id)]
+three_novelty$three_id <- info$three_id[match(three_novelty$group_name, info$annot_transcript_id)]
+
+# Group and split 5' UTR novelty
+five_novelty <- five_novelty %>% 
+  group_by(five_id) %>% 
+  group_split()
+
+# Update 5' UTR novelty status
+lt <- list()
+for (i in 1:length(five_novelty)) {
+  df_novelty <- five_novelty[[i]]
+  merged_status <- ifelse('Known' %in% df_novelty$five_novelty, 'Known', 'Novel')
+  df_novelty$five_novelty <- merged_status
+  lt[[i]] <- as_tibble(df_novelty)
+}
+
+five_novelty <- bind_rows(lt) %>% 
+  dplyr::select(five_id, five_novelty) %>% 
+  unique()
+
+# Group and split 3' UTR novelty
+three_novelty <- three_novelty %>% 
+  group_by(three_id) %>% 
+  group_split()
+
+# Update 3' UTR novelty status
+lt <- list()
+for (i in 1:length(three_novelty)) {
+  df_novelty <- three_novelty[[i]]
+  merged_status <- ifelse('Known' %in% df_novelty$three_novelty, 'Known', 'Novel')
+  df_novelty$three_novelty <- merged_status
+  lt[[i]] <- as_tibble(df_novelty)
+}
+three_novelty <- bind_rows(lt) %>% 
+  dplyr::select(three_id, three_novelty) %>% 
+  unique()
+
+# Update ORF UTR novelty
+info$five_novelty <- five_novelty$five_novelty[match(info$five_id, five_novelty$five_id)]
+info$three_novelty <- three_novelty$three_novelty[match(info$three_id, three_novelty$three_id)]
+
+# Check merged transcript novelty
+merged_transcript_novelty <- info %>% 
+  dplyr::select(new_id, annot_transcript_id,transcript_novelty)
+
+merged_transcript_novelty <- merged_transcript_novelty %>% 
+  group_by(new_id) %>% 
+  group_split()
+
+# Update merged transcript novelty status
+lt <- list()
+for (i in 1:length(merged_transcript_novelty)) {
+  df_novelty <- merged_transcript_novelty[[i]]
+  merged_status <- ifelse('Known' %in% df_novelty$transcript_novelty, 'Known', 'Novel')
+  df_novelty$merged_novelty <- merged_status
+  lt[[i]] <- as_tibble(df_novelty)
+}
+merged_transcript_novelty <- bind_rows(lt) %>% 
+  dplyr::select(new_id, merged_novelty)
+
+
+trans_merged_quanti <- info %>% 
+  dplyr::select(new_id, cds_sequence, colnames(info)[grep('rep', colnames(info))])
+trans_merged_quanti[is.na(trans_merged_quanti)] <- 0
+
+# Merge rows and calculate occurrence
+trans_merged_quanti <- trans_merged_quanti %>% 
+  group_by(new_id, cds_sequence) %>% 
+  dplyr::summarise_each(list(sum))
+
+for (i in 1:nrow(trans_merged_quanti)) {
+  trans_merged_quanti[i, 'occurrence'] <- length(which(trans_merged_quanti[i, 3:(2 + length(grep('rep', colnames(trans_merged_quanti))))] != 0))
+}
+
+# Filter merged ORF data based on occurrence
+trans_merged_filtered <- trans_merged_quanti %>% 
+  filter(occurrence >= 3)
+
+# Update transcript novelty in filtered ORF data
+trans_merged_filtered$transcript_novelty <- merged_transcript_novelty$merged_novelty[match(trans_merged_filtered$new_id, merged_transcript_novelty$new_id)]
+
+```
+
+```{r}
+# Replace 0 with NA
+transcript_info <- trans_merged_quanti
+transcript_info[transcript_info == 0] <- NA
+
+# Calculate mean, min, median, and max proportions
+transcript_info$mean_prop <- apply(transcript_info[, grep('rep', colnames(transcript_info))], 1, function(x) mean(na.omit(as.numeric(x))))
+transcript_info$min_prop <- apply(transcript_info[, grep('rep', colnames(transcript_info))], 1, function(x) min(na.omit(as.numeric(x))))
+transcript_info$median_prop <- apply(transcript_info[, grep('rep', colnames(transcript_info))], 1, function(x) median(na.omit(as.numeric(x))))
+transcript_info$max_prop <- apply(transcript_info[, grep('rep', colnames(transcript_info))], 1, function(x) max(na.omit(as.numeric(x))))
+
+# Select columns and order by occurrence in descending order
+transcript_info <- transcript_info %>% dplyr::select(new_id, mean_prop, min_prop, median_prop, max_prop, occurrence)
+transcript_info <- transcript_info[order(-transcript_info$occurrence), ]
+
+# Extract ENST_ID for known transcripts
+enstid <- info %>% filter(transcript_novelty == "Known") %>% dplyr::select(new_id, annot_transcript_id) %>% unique()
+transcript_info$ENST_ID <- enstid$annot_transcript_id[match(transcript_info$new_id, enstid$new_id)]
+
+
+#select transcript with median usage more than 1%
+transcript_info_1 <- transcript_info %>% filter(median_prop >= 0.01)
+
+transcript_info
+
+#write.csv(transcript_info, "C:/Users/Haoyu/Desktop/output/manuscript/Tables/transcript_prop_sum.csv", row.names = F)
+```
+
+Merge corresponding GTF files
+
+```{r}
+whole_gtf$transcript_novelty <- info$transcript_novelty[match(whole_gtf$transcript_id, info$annot_transcript_id)]
+
+cln3_cds_gtf <- whole_gtf %>% dplyr::filter(type == 'CDS')
+cln3_exons <- whole_gtf %>% dplyr::filter(type == 'exon')
+
+
+my_final_id <- unique(info$new_id)
+final_five_id <- unique(five_id$final_five_id)
+final_three_id <- unique(three_id$final_three_id)
+
+#As CLN3 is on - strand, "end" of the 5' most exon is 5' end
+five_end_coord <- sapply(final_five_id, function(id) {
+  orf_5 <- info %>% filter(five_id == id)
+  cln3_exons_5 <- cln3_exons %>% filter(transcript_id %in% orf_5$annot_transcript_id)
+  five_start <- round(mean(cln3_exons_5[cln3_exons_5$exon_number == min(as.integer(cln3_exons_5$exon_number)),]$end), digits = 0)
+  five_start
+})
+
+three_end_coord <- sapply(final_three_id, function(id) {
+  orf_3 <- info %>% filter(three_id == id)
+  cln3_exons_3 <- cln3_exons %>% filter(transcript_id %in% orf_3$annot_transcript_id)
+  three_end <- round(mean(cln3_exons_3[cln3_exons_3$exon_number == max(as.integer(cln3_exons_3$exon_number)),]$start), digits = 0)
+  three_end
+})
+
+five_coord <- data.frame(final_five_id, five_end_coord, row.names = NULL)
+three_coord <- data.frame(final_three_id, three_end_coord, row.names = NULL)
+
+
+result_gtf <- list()
+result_cds <- list()
+
+
+
+for (i in 1:length(my_final_id)) {
+  orf_example <- info %>% filter(new_id == my_final_id[i])
+  
+  
+cln3_exons_example <- cln3_exons %>% filter(transcript_id %in% orf_example$annot_transcript_id )
+
+cln3_cds_example <- cln3_cds_gtf %>% filter(transcript_id %in% orf_example$annot_transcript_id )
+
+#check merged transcript novelty
+transcript_status <- cln3_exons_example$transcript_novelty
+merged_status <- ifelse('Known' %in% transcript_status, 'Known', 'Novel')
+
+
+cln3_exons_example <- cln3_exons_example %>% group_by(transcript_id) %>% group_split()
+merge_gtf <- cln3_exons_example[[1]]
+merge_gtf <- merge_gtf[order(as.integer(merge_gtf$exon_number)),]
+
+
+five_start <- five_coord[five_coord$final_five_id == unique(orf_example$five_id),]$five_end_coord
+three_end <- three_coord[three_coord$final_three_id == unique(orf_example$three_id),]$three_end_coord
+
+merge_gtf$end[1] <- ifelse(length(five_start) > 0, as.integer(five_start), merge_gtf$end[1])
+
+merge_gtf$start[nrow(merge_gtf)] <- ifelse(length(three_end) > 0, as.integer(three_end), merge_gtf$start[nrow(merge_gtf)])
+
+merged_id <- info[info$annot_transcript_id == merge_gtf$transcript_id[1],]$new_id
+merge_gtf$transcript_id <- my_final_id[i]
+
+merge_gtf$transcript_status <- merged_status
+
+
+
+cln3_cds_example <- cln3_cds_example %>% group_by(transcript_id) %>% group_split()
+if(length(cln3_cds_example) != 0){
+merged_cds <- cln3_cds_example[[1]]
+merged_cds$transcript_status <- merged_status
+merged_cds$transcript_id <- my_final_id[i]
+} else {
+  merged_cds <- list()
+}
+
+result_gtf[[i]] <- merge_gtf
+result_cds[[i]] <- merged_cds
+
+
+}
+
+my_id_gtf <- unique(bind_rows(result_gtf))
+my_id_cds <- unique(bind_rows(result_cds))
+
+my_id_whole_gtf <- rbind(my_id_gtf,my_id_cds)
+
+
+#export GTF file using new IDs
+#export(my_id_whole_gtf, "E:/Encode_annotation/all/locus_selection_CLN3_my_id_with_cds.gtf", format = "gtf")
+
+my_id_filtered <- my_id_whole_gtf %>% filter(transcript_id %in% trans_merged_filtered$new_id)
+#export(my_id_filtered, "E:/Encode_annotation/all/locus_select_CLN3_my_id_filtered.gtf") 
+
+
+```
+
+
+
+
+```{r}
+library(factR)
+
+gtf <- rtracklayer::import("E:/Encode_annotation/all/locus_selection_CLN3_my_id_with_cds.gtf", format = "gtf")
+
+nmd_info <- predictNMD(gtf)
+
+
+
+nmd_info <- as.data.frame(nmd_info)
+
+nmd_info
+```
+
+
+
+ORF usage
+```{r}
+trans_merged_filtered <- trans_merged_filtered %>% ungroup()
+trans_merged_filtered$orf_id <- info$orf_id[match(trans_merged_filtered$new_id, info$new_id)]
+
+
+orf_prop <- trans_merged_filtered %>% dplyr::select('orf_id', colnames(trans_merged_filtered)[grep('rep', colnames(trans_merged_filtered))])
+#orf_prop <- info %>% dplyr::select('orf_id', colnames(info)[grep('rep', colnames(info))])
+
+
+column_sums <- colSums(orf_prop[,2:100], na.rm = TRUE)
+
+# Create a new data frame with column names as variables and sums as values
+sum_df <- data.frame(variable = names(column_sums), sum_value = column_sums)
+
+
+
+orf_prop <- orf_prop %>% group_by(orf_id) %>% summarise_all(sum)
+
+# Check occurrence of ORFs
+orf_prop$occurrence <- rowSums(orf_prop[, 2:(1+length(grep('rep', colnames(trans_merged_quanti))))] != 0)
+
+orf_prop_long <- reshape2::melt(orf_prop)
+orf_prop_long <- orf_prop_long %>% dplyr::filter(variable != 'occurrence')
+orf_prop_long$occurrence <- orf_prop$occurrence[match(orf_prop_long$orf_id, orf_prop$orf_id)]
+
+orf_prop_long[orf_prop_long == 0] <- NA
+orf_prop_long <- na.omit(orf_prop_long)
+
+#Examine major transcripts
+
+major <- orf_prop_long %>% filter(orf_id == "CLN3_235_181aa")
+
+major <- separate(major, variable, into = c("rep_number", "experiment"), sep = "(?<=rep[1-9])", remove = FALSE)
+
+
+major$tissue <- metadata_tsv$Biosample.term.name[match(major$experiment, metadata_tsv$Experiment.accession)]
+
+major$donor <- metadata_tsv$Donor.s.[match(major$experiment, metadata_tsv$Experiment.accession)]
+
+#12 tissues and 13 donors
+
+cat("Valid major transcripts were detected in", n_distinct(major$tissue), " tissues from", n_distinct(major$donor), "donors.")
+
+#write.csv(major, "C:/Users/Haoyu/Desktop/output/manuscript/Tables/major_detection_summary.csv", row.names = F)
+```
+
+
+
+Determine ORF novelty and summarise ORF usage
+```{r}
+#gtf_gencode <- rtracklayer::import("E:/reference_for_APTARS/CLN3_fusion_gencode_35.gtf")
+gtf_gencode <- rtracklayer::import("E:/reference_for_APTARS/cln3_fusion.gencode.v29.gtf")
+
+
+gtf_gencode <- gtf_gencode %>%
+  as_tibble() %>%
+  filter(type == "exon")
+
+grl_gencode <- makeGRangesListFromDataFrame(gtf_gencode, split.field = "transcript_id", names.field = "transcript_id")
+
+seqs_gencode <- extractTranscriptSeqs(ref, grl_gencode)
+
+gencode_cln3_seq <- data.frame(annot_transcript_id = names(seqs_gencode), transcript_sequence = paste(seqs_gencode))
+
+orf_gencode <- findMapORFs(grl_gencode, seqs_gencode, longestORF = TRUE, minimumLength = 0, startCodon = startDefinition(6), stopCodon = stopDefinition(1), groupByTx = TRUE) #GRangesList and DNAStringSet have to be in the same order 
+
+orftibble <- as_tibble(orf_gencode) %>% unique()
+
+orftibble <- orftibble %>%
+  group_by(names) %>%
+  mutate(total_length = sum(width)) %>%
+  ungroup() %>%
+  separate(names, c('transcript_id', 'n_orf'), sep = '_') %>%
+  mutate(total_length = as.integer(total_length))
+
+orf_longest <- orftibble %>%
+  group_by(transcript_id) %>%
+  top_n(1, total_length) %>%
+  unique()
+
+grl_gencode_cds <- makeGRangesListFromDataFrame(orf_longest, split.field = "transcript_id", names.field = "transcript_id")
+
+gencode_cds <- extractTranscriptSeqs(ref, grl_gencode_cds)
+
+gencode_cln3_cds <- data.frame(gencode_transcript_id = names(gencode_cds), cds_sequence = paste(gencode_cds))
+
+novel_orf <- cln3_cds %>%
+  filter(!cds_sequence %in% gencode_cln3_cds$cds_sequence)
+
+
+# Calculate mean, min, median, and max proportions for each ORF
+orf_prop[orf_prop == 0] <- NA
+
+for (i in 1:nrow(orf_prop)) {
+  prop <- as.numeric(orf_prop[i, grep('rep', colnames(orf_prop))])
+  prop <- na.omit(prop)
+  
+  orf_prop[i, 'mean_prop'] <- mean(prop)
+  orf_prop[i, 'min_prop'] <- min(prop)
+  orf_prop[i, 'median_prop'] <- median(prop)
+  orf_prop[i, 'max_prop'] <- max(prop)
+}
+
+
+
+orf_prop_sum <- orf_prop %>%
+  dplyr::select(orf_id, mean_prop, min_prop, median_prop, max_prop, occurrence) %>%
+  arrange(desc(occurrence))
+
+orf_prop_sum$novelty <- ifelse(orf_prop_sum$orf_id %in% novel_orf$orf_id, "Novel", "Known")
+
+orf_prop_sum
+
+
+#export ORF usage summary
+#write.csv(orf_prop_sum, "C:/Users/Haoyu/Desktop/output/manuscript/Tables/orf_prop_sum.csv", row.names = F)
+#write.csv(orf_prop_long, "C:/Users/Haoyu/Desktop/output/manuscript/Tables/orf_prop_long.csv", row.names = F)
+```
+
+
+Transcript type determination
+```{r}
+cln3_length <- cln3_cds %>%
+  mutate(num_aa = (str_length(cds_sequence) - 3) / 3)
+
+cln3_length$protein_coding <- ifelse(cln3_length$num_aa >= 150, T, F)
+
+trans_merged_filtered$five_id <- info$five_id[match(trans_merged_filtered$new_id, info$new_id)]
+trans_merged_filtered$three_id <- info$three_id[match(trans_merged_filtered$new_id, info$new_id)]
+trans_merged_filtered$five_novelty <- five_novelty$five_novelty[match(trans_merged_filtered$five_id, five_novelty$five_id)]
+trans_merged_filtered$three_novelty <- three_novelty$three_novelty[match(trans_merged_filtered$three_id, three_novelty$three_id)]
+
+trans_merged_filtered$nmd <- nmd_info$is_NMD[match(trans_merged_filtered$new_id, nmd_info$transcript)]
+trans_merged_filtered$protein_coding <- cln3_length$protein_coding[match(trans_merged_filtered$orf_id, cln3_length$orf_id)]
+
+trans_merged_filtered$type <- ifelse(trans_merged_filtered$nmd, "NMD",
+                                   ifelse(!trans_merged_filtered$protein_coding, "Non-coding", "Coding"))
+
+novelty <- trans_merged_filtered %>%
+  filter(type == "Coding") %>%
+  dplyr::select(new_id, transcript_novelty, five_novelty, three_novelty, orf_id)
+
+novelty$orf_novelty <- orf_prop_sum$novelty[match(novelty$orf_id, orf_prop_sum$orf_id)]
+
+novelty$merged_novelty <- if_else(novelty$transcript_novelty == "Known", "Known",
+                                  if_else(novelty$orf_novelty == "Novel" & novelty$five_novelty == "Known" & novelty$three_novelty == "Known", "Novel_ORF_only",
+                                         if_else(novelty$orf_novelty == "Novel" & novelty$five_novelty == "Novel" | novelty$three_novelty == "Novel", "Novel_ORF_and_UTR",
+                                                if_else(novelty$orf_novelty == "Known" & (novelty$five_novelty == "Known" | is.na(novelty$five_novelty)) & novelty$three_novelty == "Novel", "Novel_3'UTR_only",
+                                                       if_else(novelty$orf_novelty == "Known" & (novelty$five_novelty == "Novel" | is.na(novelty$five_novelty)) & novelty$three_novelty == "Known", "Novel_5'UTR_only",
+                                                               if_else(novelty$orf_novelty == "Known" & novelty$five_novelty == "Known" & novelty$three_novelty == "Known", "Novel_combination", false = "11", missing = "Novel_combination"))))))
+
+trans_merged_filtered$coding_novelty <- novelty$merged_novelty[match(trans_merged_filtered$new_id, novelty$new_id)]
+
+trans_merged_filtered$transcript_type <- ifelse(is.na(trans_merged_filtered$coding_novelty), paste(trans_merged_filtered$type, "_", trans_merged_filtered$transcript_novelty, sep = ""),
+                                              paste(trans_merged_filtered$type, "_", trans_merged_filtered$coding_novelty, sep = ""))
+
+
+table(trans_merged_filtered$transcript_type)
+
+
+
+strict <- trans_merged_filtered %>% 
+  filter(type == "Coding" & transcript_novelty == "Novel") %>%
+  filter(new_id %in% transcript_info_1$new_id)
+```
+
+
+
+Tissue-specificity of merged transcripts
+
+```{r}
+library(GenomicFeatures)
+library(reshape2)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(RColorBrewer)
+library(cowplot)
+library(viridis)
+
+# Process data frames
+df <- trans_merged_filtered %>% dplyr::select(new_id, orf_id, contains('rep')) 
+df_melt <- melt(df, id.vars = c("new_id", "orf_id"))
+
+# Separate variable column
+df_melt <- df_melt %>% separate(variable, into = c("rep", "experiment"), sep = "(?=[E][N])", remove = FALSE, fill = "right")
+df_melt$rep <- gsub("proportion ",replacement = "", x = df_melt$rep)
+
+
+# Match tissue information
+df_melt$tissue <- metadata_tsv$Biosample.term.name[match(df_melt$experiment, metadata_tsv$Experiment.accession)]
+
+# Add occurrence column
+df_melt$occurrence <- trans_merged_filtered$occurrence[match(df_melt$new_id, trans_merged_filtered$new_id)]
+
+# Load organ information
+organ_info <- read.csv("E:/Encode_annotation/all/organ_info.csv", sep = ",")
+df_melt$organ <- organ_info$organ[match(df_melt$tissue, organ_info$Biosample.term.name)] #Check if separate cell lines
+df_melt$organ <- gsub("_", " ", df_melt$organ)
+
+# Filter non-zero values
+df_melt_non_zero <- df_melt %>% filter(value != 0)
+
+
+
+df_list <- df_melt_non_zero %>% group_by(new_id,tissue) %>% group_split()
+
+
+tissue_usage <- list()
+for (i in 1:length(df_list)){
+  df <- df_list[[i]]
+  df$avg_prop <- mean(df$value)
+  
+  tissue_usage[[i]] <- df
+  
+}
+
+tissue_usage <- bind_rows(tissue_usage)
+
+
+result <- tissue_usage %>% dplyr::select(new_id, tissue, organ, avg_prop) %>% unique()
+
+# Process tissue-specific transcripts
+result_l <- result %>%
+  group_by(new_id) %>%
+  group_split()
+
+tslist <- list()
+
+for (i in 1:length(result_l)){
+  df <- result_l[[i]]
+  sorted_avg_prop <- sort(df$avg_prop, decreasing = TRUE)
+  second_largest <- sorted_avg_prop[2]
+  df$tissue_specific <- ifelse(nrow(df) == 1, T,ifelse(max(df$avg_prop) >= 2 * second_largest, TRUE, FALSE))
+  tslist[[i]] <- df
+  
+}
+
+tsinfo <- bind_rows(tslist)
+#tsinfo$tissue <- metadata_tsv$Biosample.term.name[match(tsinfo$experiment, metadata_tsv$Experiment.accession)]
+
+
+tst <- tsinfo %>% filter(tissue_specific == TRUE) %>% 
+  group_by(new_id) %>% 
+  group_split()
+
+ts_list <- list()
+for (i in 1:length(tst)){
+  
+  df <- tst[[i]]
+  df <- df %>% filter(avg_prop == max(df$avg_prop))
+  ts_list[[i]] <- df
+  
+}
+
+tst <- bind_rows(ts_list)
+
+#tst$organ <- organ_info$organ[match(tst$tissue, organ_info$Biosample.term.name)]
+tst$orf_id <- info$orf_id[match(tst$new_id, info$new_id)]
+
+
+#tsinfo <- tsinfo %>% dplyr::select(new_id, tissue_specific) %>% unique()
+
+
+# Generate tissue-specific transcript CSV
+#write.csv(tst, "C:/Users/Haoyu/Desktop/output/manuscript/Tables/tissue_specific_transcripts.csv", row.names = FALSE)
+
+
+trans_merged_filtered$ts <- ifelse(trans_merged_filtered$new_id %in% tst$new_id, T, F)
+```
+
+
+UTRs summary
+
+```{r}
+library(GenomicFeatures)
+
+
+
+
+txdb <- makeTxDbFromGFF("E:/Encode_annotation/all/locus_select_CLN3_my_id_filtered.gtf", format="gtf") #this will take some time
+five <- fiveUTRsByTranscript(txdb, use.names = T)
+three <- threeUTRsByTranscript(txdb, use.names = T)
+
+
+
+five <- as_tibble(five)
+three <- as_tibble(three)
+
+five_1 <- five %>% filter(exon_rank == 1)
+five_1 <- five_1 %>% group_by(exon_name) %>% group_split
+
+
+
+five3 <- five %>% filter(group_name %in% trans_merged_filtered$new_id)
+three3 <- three %>% filter(group_name %in% trans_merged_filtered$new_id)
+
+five3$occurrence <- trans_merged_filtered$occurrence[match(five3$group_name, trans_merged_filtered$new_id)]
+three3$occurrence <- trans_merged_filtered$occurrence[match(three3$group_name, trans_merged_filtered$new_id)]
+
+
+
+five3$five_id <- info$five_id[match(five3$group_name, info$new_id)]
+three3$three_id <- info$three_id[match(three3$group_name, info$new_id)]
+
+
+#five3 <- as_tibble(five3)
+#three3 <- as_tibble(three3)
+
+five3 <- five3 %>% dplyr::select(-c(group_name, width, group, exon_rank, exon_name, exon_id)) %>% group_by(five_id, start, end, strand,seqnames) %>% summarise_each(list(sum))
+three3 <- three3 %>% dplyr::select(-c(group_name, width, group, exon_rank,exon_name, exon_id)) %>% group_by(three_id, start, end, strand,seqnames) %>% summarise_each(list(sum))
+
+
+
+
+five3$five_novelty <- info$five_novelty[match(five3$five_id, info$five_id)]
+three3$three_novelty <- info$three_novelty[match(three3$three_id, info$three_id)]
+
+
+five_struc <-five3 %>% ggplot(aes(
+  xstart = start,
+  xend = end,
+  y = reorder(five_id,occurrence),
+  
+)) +
+  geom_range(
+    # fill = "white",
+    height = 0.25,
+  aes(fill = five_novelty)) +
+  geom_intron(
+    data = to_intron(five3, "five_id"),
+    aes(strand = strand),
+    arrow.min.intron.length = 500,
+  ) + theme_bw()+ xlab("Coordinates on CHR16") + ylab("5'UTR ID") +  guides(fill = guide_legend(title = "UTRs novelty"))+
+  theme(axis.title.x = element_text(face = "bold"),
+        axis.title.y = element_text(face = "bold"))
+
+
+
+
+three_struc <- three3 %>% ggplot(aes(
+  xstart = start,
+  xend = end,
+  y = reorder(three_id,occurrence)
+  
+)) +
+  geom_range(
+    # fill = "white",
+    height = 0.25,
+  aes(fill = three_novelty)) +
+  geom_intron(
+    data = to_intron(three3, "three_id"),
+    aes(strand = strand),
+    arrow.min.intron.length = 500,
+  ) + theme_bw()+ xlab("Coordinates on CHR16") + ylab("3'UTR ID") + guides(fill = guide_legend(title = "UTRs novelty"))+
+  theme(axis.title.x = element_text(face = "bold"),
+        axis.title.y = element_text(face = "bold"))
+
+
+valid_five <- five3 %>% ungroup() %>% dplyr::select(five_id, five_novelty) %>% unique()
+
+valid_three <- three3 %>% ungroup() %>% dplyr::select(three_id, three_novelty) %>% unique()
+
+
+table(valid_five$five_novelty) #13 known, 69 novel
+table(valid_three$three_novelty) #8 known 23 novel
+
+
+#check number of UTRs that specific ORFs have
+
+five_info <- trans_merged_filtered %>% dplyr::select(orf_id, five_id) %>% unique() 
+#438:23 223:16
+
+three_info <- trans_merged_filtered %>% dplyr::select(orf_id, three_id) %>% unique()
+#181:6
+orf_3utr <- table(three_info$orf_id) %>% as.data.frame()
+orf_5utr <- table(five_info$orf_id) %>% as.data.frame()
+```
+
+Check UTRs for the same ORFs
+```{r}
+library(viridis)
+library(Rfast)
+library(scales)
+
+organ_info <- read.csv("E:/Encode_annotation/all/organ_info.csv", sep = ",")
+
+plot_utr <- function(ORF, UTR_type){
+
+  
+orf_filter <- trans_merged_filtered %>% filter(orf_id == ORF)
+
+
+gtf_filter <- my_id_gtf %>% dplyr::filter(transcript_id %in% orf_filter$new_id) %>% unique()
+cds_filter <- my_id_cds %>% dplyr::filter(transcript_id %in% orf_filter$new_id) %>% unique()
+
+
+
+gtf_filter$occurrence <- trans_merged_filtered$occurrence[match(gtf_filter$transcript_id,trans_merged_filtered$new_id)]
+cds_filter$occurrence <- trans_merged_filtered$occurrence[match(cds_filter$transcript_id,trans_merged_filtered$new_id)]
+
+
+gtf_filter$orf_id <- trans_merged_filtered$orf_id[match(gtf_filter$transcript_id,trans_merged_filtered$new_id)]
+cds_filter$orf_id <- trans_merged_filtered$orf_id[match(cds_filter$transcript_id,trans_merged_filtered$new_id)]
+
+
+if (UTR_type == "5"){
+
+
+five_prop <- orf_filter %>% dplyr::filter(five_id %in% orf_filter$five_id) %>% dplyr::select(five_id,five_novelty,colnames(orf_filter)[grep('rep', colnames(orf_filter))])
+
+
+five_prop <- five_prop %>% group_by(five_id, five_novelty) %>% summarise_each(list(sum))
+
+
+
+#check occurrence
+for (i in 1:nrow(five_prop)){
+  
+  
+  five_prop[i,'occurrence'] <- length(which(five_prop[i,2:(length(colnames(five_prop)[grep('rep', colnames(five_prop))])+1)] != 0))
+        
+  
+}
+
+
+
+five_occur <- five_prop %>% dplyr::select(five_id,five_novelty,occurrence)
+
+
+#remove occurrence of no 5UTR, 5UTR_no occurred in 10 samples
+five_occur <- five_occur %>% filter(!five_id == "5UTR_no")
+
+five_prop_long <- reshape2::melt(five_prop)
+
+
+five_prop_long <- five_prop_long %>% dplyr::filter(variable != 'occurrence')
+#five_prop_long <- five_prop_long %>% filter(variable %in% colname_organ)
+
+
+
+
+five_prop_long <- five_prop_long %>% separate(variable, into = c("rep", "experiment"), sep ="(?=[E][N])", remove = FALSE, fill = "right" )
+
+five_prop_long$tissue <- metadata_tsv$Biosample.term.name[match(five_prop_long$experiment, metadata_tsv$Experiment.accession)]
+
+
+#remove NAs
+
+five_prop_long[five_prop_long == 0] <- NA
+
+five_prop_mis <- five_prop_long %>% filter(is.na(five_prop_long$value)) %>% dplyr::select(five_id, value, tissue) %>% unique()
+
+five_prop_long <- five_prop_long[complete.cases(five_prop_long),]
+
+
+#organ_info <- read.csv("E:/Encode_annotation/all/organ_info.csv", sep = ",")
+
+five_ts <- five_prop_long %>% dplyr::select(five_id, value, tissue) 
+
+utr_mean_prop_tissue <- five_ts %>% group_by(five_id,tissue) %>% summarise_each(list(mean))
+
+five_ts_l <- utr_mean_prop_tissue %>% group_by(five_id) %>% group_split()
+
+
+utrlist <- list()
+
+for (i in 1:length(five_ts_l)){
+  df <- five_ts_l[[i]]
+  sorted_avg_prop <- sort(df$value, decreasing = TRUE)
+  
+  # Get the second largest value
+  second_largest <- sorted_avg_prop[2]
+  
+  df$ts <- ifelse(nrow(df) == 1,T,ifelse(max(df$value) >= 2 * second_largest, T, F))
+  utrlist[[i]] <- df
+  
+}
+
+
+five_ts <- bind_rows(utrlist)
+five_ts$organ <- organ_info$organ_new[match(five_ts$tissue, organ_info$Biosample.term.name)]
+
+five_ts$organ <- gsub("_", " ", five_ts$organ)
+five_ts$occurrence <- five_occur$occurrence[match(five_ts$five_id, five_occur$five_id)]
+
+utr_ts_info <- five_ts %>% filter(ts == TRUE) %>% group_by(five_id) %>% group_split()
+
+ts_list <- list()
+for (i in 1:length(utr_ts_info)){
+  
+  df <- utr_ts_info[[i]]
+  df <- df %>% filter(value == max(df$value))
+  ts_list[[i]] <- df
+  
+}
+
+utr_ts_info <- bind_rows(ts_list)
+
+utr_ts_info$organ <- organ_info$organ_new[match(utr_ts_info$tissue, organ_info$Biosample.term.name)]
+
+
+
+five_occur$ts <- five_ts$ts[match(five_occur$five_id, five_ts$five_id)]
+
+
+#five_usage <- ggplot(five_prop_long, aes(reorder(x=five_id, occurrence), y= value, fill = five_novelty)) +
+#  geom_boxplot(outlier.shape = NA)+
+#  geom_jitter(color="black", size=0.5, alpha=0.9, width = 0.25) +
+#  theme(
+#    #  legend.position="none",
+#    plot.title = element_text(size=11)
+#  ) +scale_y_continuous(n.breaks = 3, labels = scales::percent, limits = c(0,0.5) )+
+#  #ggtitle("Proportion of reads mapped to merged transcripts detected in six or more samples") +
+#  ylab("Proportion") + xlab("UTRs")  +theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+#                                                   panel.background = element_blank(), axis.line = element_line(colour = "black"))+
+#  theme(axis.text.x = element_text(angle = 1)) +coord_flip() + theme(axis.title.x = element_text(face = "bold"),
+#         axis.title.y = element_text(face = "bold"))
+#+ scale_fill_manual(values = color_used, limits = force)+ guides(fill = guide_legend(ncol = 1))
+
+
+
+five_gtf <- five3 %>% dplyr::filter(five_id %in% orf_filter$five_id) %>% dplyr::select(-c(occurrence))
+
+five_gtf$occurrence <- five_occur$occurrence[match(five_gtf$five_id,five_occur$five_id)]
+five_gtf$five_novelty <- five_occur$five_novelty[match(five_gtf$five_id, five_occur$five_id)]
+five_gtf$ts <- five_ts$ts[match(five_gtf$five_id, five_ts$five_id)]
+
+
+five_structure <- five_gtf %>% ggplot(aes(
+  xstart = start,
+  xend = end,
+  y = reorder(five_id,occurrence),
+  fill = ts
+)) +
+  geom_range(
+    # fill = "white",
+    height = 0.25
+  ) +
+  geom_intron(
+    data = to_intron(five_gtf, "five_id"),
+    aes(strand = strand),
+    arrow.min.intron.length = 500,
+  ) + theme_bw()+ xlab("Coordinates on CHR16") + ylab(NULL) +theme(axis.title.x = element_text(face = "bold"),
+         axis.title.y = element_text(face = "bold"))+ 
+  scale_fill_manual(values = c("TRUE" = "orange", "FALSE" = "black")) + guides(fill=guide_legend(title="Tissue specific"))+ theme(axis.text.y = element_text(size = 15))
+
+
+
+
+
+#occurrence_five <-  ggplot(five_occur,aes(x=reorder(five_id, occurrence), 
+#                                                     y=occurrence, fill = ts)) +
+#  geom_col( position = "identity") + 
+#  theme(axis.text.x = element_text(angle = 90))+ coord_flip() + 
+#  xlab("UTRs") + ylab('Occurrence') + 
+#  theme(axis.title.x = element_text(size = rel(1)))+theme(axis.title.y = element_text(size = rel(1.5))) + 
+#  scale_y_continuous(breaks = c(0,20,40,60,80,sample_size)) + theme_bw() +theme(axis.title.x = element_text(face = "bold"),
+#         axis.title.y = element_text(face = "bold"))#+ scale_fill_manual(values = color_used)
+
+
+five_prop_long <- five_prop_long %>% separate(variable, into = c("rep", "experiment"), sep ="(?=[E][N])", remove = FALSE, fill = "right" )
+
+five_prop_long$tissue <- metadata_tsv$Biosample.term.name[match(five_prop_long$experiment, metadata_tsv$Experiment.accession)]
+
+
+
+
+#organ_info <- read.csv("E:/Encode_annotation/all/organ_info.csv", sep = ",")
+five_prop_long$organ <- organ_info$organ_new[match(five_prop_long$tissue, organ_info$Biosample.term.name)]
+
+five_prop_long$organ <- gsub("_", " ", five_prop_long$organ)
+
+
+
+
+five_prop_mis <- five_prop_mis %>% filter(!tissue %in% five_ts$tissue)
+five_prop_mis$organ <- organ_info$organ_new[match(five_prop_mis$tissue, organ_info$Biosample.term.name)]
+
+five_prop_mis$organ <- gsub("_", " ", five_prop_mis$organ)
+five_prop_mis$occurrence <- five_occur$occurrence[match(five_prop_mis$five_id, five_occur$five_id)]
+five_prop_mis$ts <- five_ts$ts[match(five_prop_mis$five_id, five_ts$five_id)]
+
+five_full <- bind_rows(five_ts,five_prop_mis)
+
+ five_heat <- ggplot(five_full, aes(tissue, reorder(five_id, occurrence))) +geom_tile(aes(fill = value), color = NA) + scale_fill_viridis(na.value = NA, labels = scales::label_percent(accuracy = 0.1)) + facet_grid(.~organ, scales = "free", space = "free") + theme_bw()+
+  xlab("Tissues")+
+  theme(panel.border = element_blank(),
+        axis.text.x = element_text(angle = 90, vjust=0.5, hjust=1, size = 11), 
+        axis.text.y = element_text(size = 11),
+      strip.text.x = element_text(margin = margin(0.5,0,0.5,0, "cm"), angle = 90), 
+      strip.text = element_text(face = "bold", size = rel(1.2)),
+      #strip.background = element_rect(colour = "grey"),
+      axis.title.x = element_text(face = "bold", size = 12),
+      legend.key.height = unit(0.8,'cm'),
+      legend.key.width = unit(0.7,'cm'))# +  scale_x_discrete(labels = wrap_format(15))
+
+
+
+
+ utr_ts_plot <- cowplot::plot_grid(five_structure+ theme(axis.title.y = element_blank(), legend.position = "left"), 
+                                   five_heat + 
+                                     theme(axis.title.y = element_blank(), 
+                                           axis.text.y = element_blank(),
+                                           legend.position = "none"
+                                           ), 
+                   nrow=1,labels= NA, rel_widths = c(3.5, 5), align = 'h', axis = "bt")
+
+
+} else {
+  
+three_prop <- orf_filter %>% dplyr::filter(three_id %in% orf_filter$three_id) %>% dplyr::select(three_id,three_novelty,colnames(orf_filter)[grep('rep', colnames(orf_filter))])
+
+
+three_prop <- three_prop %>% group_by(three_id, three_novelty) %>% summarise_each(funs(sum(., na.rm = TRUE)))
+
+
+#check occurrence
+for (i in 1:nrow(three_prop)){
+  
+  
+  three_prop[i,'occurrence'] <- length(which(three_prop[i,2:(length(colnames(three_prop)[grep('rep', colnames(three_prop))])+1)] != 0))
+        
+}
+
+three_occur <- three_prop %>% dplyr::select(three_id,three_novelty,occurrence)
+
+
+#remove occurrence of no 5UTR, 5UTR_no occurred in 10 samples
+three_occur <- three_occur %>% filter(!three_id == "3UTR_no")
+three_occur$ts <- trans_merged_filtered$ts[match(three_occur$three_id, trans_merged_filtered$three_id)]
+
+
+three_prop_long <- reshape2::melt(three_prop)
+
+
+three_prop_long <- three_prop_long %>% dplyr::filter(variable != 'occurrence')
+#three_prop_long <- three_prop_long %>% filter(variable %in% colname_organ)
+
+
+
+
+three_prop_long <- three_prop_long %>% separate(variable, into = c("rep", "experiment"), sep ="(?=[E][N])", remove = FALSE, fill = "right" )
+
+three_prop_long$tissue <- metadata_tsv$Biosample.term.name[match(three_prop_long$experiment, metadata_tsv$Experiment.accession)]
+
+
+#remove NAs
+
+three_prop_long[three_prop_long == 0] <- NA
+
+#set up tissues where specific UTR is not detected
+three_prop_mis <- three_prop_long %>% filter(is.na(three_prop_long$value)) %>% dplyr::select(three_id, value, tissue) %>% unique()
+
+three_prop_long <- three_prop_long[complete.cases(three_prop_long),]
+
+
+#organ_info <- read.csv("E:/Encode_annotation/all/organ_info.csv", sep = ",")
+
+three_ts <- three_prop_long %>% dplyr::select(three_id, value, tissue) 
+
+utr_mean_prop_tissue <- three_ts %>% group_by(three_id,tissue) %>% summarise_each(list(~ mean(., na.rm = TRUE)))
+
+three_ts_l <- utr_mean_prop_tissue %>% group_by(three_id) %>% group_split()
+
+
+utrlist <- list()
+
+for (i in 1:length(three_ts_l)){
+  df <- three_ts_l[[i]]
+ sorted_avg_prop <- sort(df$value, decreasing = TRUE)
+  
+  # Get the second largest value
+  second_largest <- sorted_avg_prop[2]
+  df$ts <- ifelse(nrow(df) == 1, T,ifelse(max(df$value) >= 2 * second_largest, T, F))
+  utrlist[[i]] <- df
+  
+}
+
+
+
+three_ts <- bind_rows(utrlist)
+three_ts$organ <- organ_info$organ_new[match(three_ts$tissue, organ_info$Biosample.term.name)]
+
+three_ts$organ <- gsub("_", " ", three_ts$organ)
+three_ts$occurrence <- three_occur$occurrence[match(three_ts$three_id, three_occur$three_id)]
+
+utr_ts_info <- three_ts %>% filter(ts == TRUE) %>% group_by(three_id) %>% group_split()
+
+ts_list <- list()
+for (i in 1:length(utr_ts_info)){
+  
+  df <- utr_ts_info[[i]]
+  df <- df %>% filter(value == max(df$value))
+  ts_list[[i]] <- df
+  
+}
+
+utr_ts_info <- bind_rows(ts_list)
+
+utr_ts_info$organ <- organ_info$organ_new[match(utr_ts_info$tissue, organ_info$Biosample.term.name)]
+
+
+
+three_occur$ts <- three_ts$ts[match(three_occur$three_id, three_ts$three_id)]
+
+
+
+
+#three_usage <- ggplot(three_prop_long, aes(reorder(x=three_id, occurrence), y= value, fill = three_novelty)) +
+#  geom_boxplot(outlier.shape = NA)+
+#  geom_jitter(color="black", size=0.5, alpha=0.9, width = 0.25) +
+#  theme(
+#    #  legend.position="none",
+#    plot.title = element_text(size=11)
+#  ) +scale_y_continuous(n.breaks = 3, labels = scales::percent, limits = c(0,0.5) )+
+#  #ggtitle("Proportion of reads mapped to merged transcripts detected in six or more samples") +
+#  ylab("Proportion") + xlab("UTRs")  +theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+#                                                   panel.background = element_blank(), axis.line = element_line(colour = #"black"))+
+#  theme(axis.text.x = element_text(angle = 1)) +coord_flip() + theme(axis.title.x = element_text(face = "bold"),
+#         axis.title.y = element_text(face = "bold"))
+#+ scale_fill_manual(values = color_used, limits = force)+ guides(fill = guide_legend(ncol = 1))
+
+
+three_gtf <- three3 %>% dplyr::filter(three_id %in% orf_filter$three_id) %>% dplyr::select(-c(occurrence))
+
+three_gtf$occurrence <- three_occur$occurrence[match(three_gtf$three_id,three_occur$three_id)]
+three_gtf$three_novelty <- three_occur$three_novelty[match(three_gtf$three_id, three_occur$three_id)]
+three_gtf$ts <- three_ts$ts[match(three_gtf$three_id, three_ts$three_id)]
+
+
+three_gtf$three_id <- paste0(" ", three_gtf$three_id)
+
+
+three_structure <- three_gtf %>% ggplot(aes(
+  xstart = start,
+  xend = end,
+  y = reorder(three_id,occurrence),
+  fill = ts
+)) +
+  geom_range(
+    # fill = "white",
+    height = 0.25
+  ) +
+  geom_intron(
+    data = to_intron(three_gtf, "three_id"),
+    aes(strand = strand),
+    arrow.min.intron.length = 500,
+  ) + theme_bw()+ xlab("Coordinates on CHR16") + ylab(NULL) +theme(axis.title.x = element_text(face = "bold"),
+         axis.title.y = element_text(face = "bold")) + 
+  scale_fill_manual(values = c("TRUE" = "orange", "FALSE" = "black")) + 
+  guides(fill=guide_legend(title="Tissue specific"))+ theme(axis.text.y = element_text(size = 15)) 
+
+
+
+
+
+#occurrence_three <-  ggplot(three_occur,aes(x=reorder(three_id, occurrence), 
+#                                                     y=occurrence, fill = ts)) +
+#  geom_col( position = "identity") + 
+#  theme(axis.text.x = element_text(angle = 90))+ coord_flip() + 
+#  xlab("UTRs") + ylab('Occurrence') + 
+#  theme(axis.title.x = element_text(size = rel(1)))+theme(axis.title.y = element_text(size = rel(1.5))) + 
+#  scale_y_continuous(breaks = c(0,20,40,60,80,sample_size)) + theme_bw() +theme(axis.title.x = element_text(face = "bold"),
+#         axis.title.y = element_text(face = "bold"))#+ scale_fill_manual(values = color_used)
+
+
+
+
+#three_ts_full <- merge(x = three_ts, y = organ_info, by.x = "organ", by.y = "organ_new")
+
+
+three_prop_mis <- three_prop_mis %>% filter(!tissue %in% three_ts$tissue)
+three_prop_mis$organ <- organ_info$organ_new[match(three_prop_mis$tissue, organ_info$Biosample.term.name)]
+
+three_prop_mis$organ <- gsub("_", " ", three_prop_mis$organ)
+three_prop_mis$occurrence <- three_occur$occurrence[match(three_prop_mis$three_id, three_occur$three_id)]
+three_prop_mis$ts <- three_ts$ts[match(three_prop_mis$three_id, three_ts$three_id)]
+
+three_full <- bind_rows(three_ts,three_prop_mis)
+
+ three_heat <- ggplot(three_full, aes(tissue, reorder(three_id, occurrence))) +geom_tile(aes(fill = value), color = NA) + scale_fill_viridis(na.value = NA, labels = scales::label_percent(accuracy = 0.1)) + facet_grid(.~organ, scales = "free", space = "free") + theme_bw()+
+  xlab("Tissues")+
+  theme(panel.border = element_blank(),
+        axis.text.x = element_text(angle = 90, vjust=0.5, hjust=1, size = 11), 
+        axis.text.y = element_text(size = 11),
+      strip.text.x = element_text(margin = margin(0.5,0,0.5,0, "cm"), angle = 90), 
+      strip.text = element_text(face = "bold", size = rel(1.2)),
+      #strip.background = element_rect(colour = "grey"),
+      axis.title.x = element_text(face = "bold", size = 12),
+      legend.key.height = unit(0.8,'cm'),
+      legend.key.width = unit(0.7,'cm'))# +  scale_x_discrete(labels = wrap_format(15))
+
+
+
+
+
+
+ utr_ts_plot <- cowplot::plot_grid(three_structure+ theme(axis.title.y = element_blank(),legend.position = "left"),
+                                   three_heat + 
+                                     theme(axis.title.y = element_blank(), 
+                                           axis.text.y = element_blank(),
+                                           legend.position = "none"
+                                           ), 
+                   nrow=1,labels= NA, rel_widths = c(3.5, 5), align = 'h', axis = "bt")
+  
+  
+}
+
+.GlobalEnv$utr_ts_info <- utr_ts_info
+.GlobalEnv$utr_plot <- utr_ts_plot
+print(utr_ts_plot)
+return(utr_ts_info)
+
+
+}
+
+#plot_utr("CLN3_235_181aa", 3)
+#info_181 <- utr_ts_info
+```
+
+```{r}
+#write.csv(trans_merged_filtered, "C:/Users/Haoyu/Desktop/output/manuscript/Tables/trans_merged_summary.csv", row.names = F)
+```
+
