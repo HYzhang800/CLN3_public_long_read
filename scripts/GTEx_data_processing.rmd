@@ -1,0 +1,129 @@
+
+```{r}
+library(tidyverse)
+library(data.table)
+library(R.utils)
+library(here)
+library(reshape2)
+
+#GTEx exon-exon junction read counts data filtered for chr16
+gtex <- fread(file = "E:/splicing junctions/GTEx_V8/test_chr16.gct", sep = "\t", header = T, stringsAsFactors = F)
+
+
+#clean data
+gtex <- gtex %>% 
+  separate(Name, c("chr", "acceptor", "donor"),  sep = "_")
+
+#select filter data for target region to include the readthrough gene locus
+
+gtex_cln3 <- gtex %>% 
+  filter(as.numeric(donor) < 28495000 & as.numeric(donor) > 28450000)
+
+gteX_fusion <- reshape2::melt(gtex_cln3, id.vars = c("chr", "acceptor", "donor", "Description"))
+#reads for 'common' exons between CLN3 and ENSG00000261832 are duplicated
+
+library(stringr)
+
+gteX_fusion$sample <- stringr::str_extract(gteX_fusion$variable, "^[^-]+-[^-]+")
+
+
+test <- read.delim(file = "E:/splicing junctions/GTEx_V8/GTEx_Analysis_v8_Annotations_SampleAttributesDS.txt", sep = "\t")
+
+
+gteX_fusion$tissue <- test$SMTS[match(gteX_fusion$variable, test$SAMPID)]
+
+#select junctions for the readthrough transcripts 
+all_fusion <- gteX_fusion %>% filter(donor >= 28474111  & acceptor  <= 28471175)
+all_fusion$junction <- paste(all_fusion$donor, "-", all_fusion$acceptor, sep = "")
+
+unique(all_fusion$junction)
+#five junctions in total
+
+##Checking in how many organs was each splice junction detected for each donor#
+
+fusion_junc_reads <- gteX_fusion %>% 
+  filter(donor == "28482104" & acceptor == "28466903" |
+                                       donor == "28477463" & acceptor == "28466903" |
+                                        donor == "28476250" & acceptor == "28471175" |
+                                        donor == "28476250" & acceptor == "28466903" |
+           donor == "28477011" & acceptor == "28466903") %>%
+  filter(value != 0)
+
+# Calculate the total number of samples in each tissue
+tissue_sample_counts <- fusion_junc_reads %>%
+  group_by(tissue) %>%
+  summarize(total_samples = n_distinct(sample))
+
+
+# Calculate the detection rates for each junction in each tissue
+detection_rates <- fusion_junc_reads %>% 
+  ungroup() %>%
+  group_by(acceptor,donor, tissue) %>% group_split()
+
+result <- list()
+for (i in 1:length(detection_rates)){  
+  
+  df <- detection_rates[[i]]
+  df <- df %>% filter(value != 0 &!is.na(value))
+  total_detected <- n_distinct(df$sample)
+  total <- tissue_sample_counts[(tissue_sample_counts$tissue == unique(df$tissue)),]$total_samples
+   df <- df %>% mutate(num_detected = total_detected)
+    df <- df %>% mutate(num_samples = total)
+  df <- df %>% mutate(detection_rate = total_detected / total)
+  result[[i]] <- df
+ 
+}
+
+detection_rates <- bind_rows(result) 
+
+detection <- detection_rates %>% 
+  dplyr::select(acceptor, donor, tissue, num_detected, num_samples, detection_rate) %>%
+  unique()
+
+detection_large <- detection %>% filter(num_samples >= 100)
+
+
+max_detection_rows <- detection_large %>%
+  group_by(acceptor, donor) %>%
+  slice_max(order_by = detection_rate, n = 1)
+
+
+
+###calculate average reads
+###avg reads within tissues first
+
+organ_reads <- fusion_junc_reads %>%
+  ungroup() %>%
+  group_by(acceptor, donor, tissue, sample) %>%
+  summarize(organ_avg_reads = mean(value, na.rm = T))
+
+average_reads <- organ_reads %>%
+  ungroup() %>%
+  group_by(acceptor, donor, tissue) %>%
+  summarize(average_reads = mean(organ_avg_reads, na.rm = TRUE))
+
+average_reads_max <- average_reads %>% ungroup() %>% group_by(acceptor, donor) %>%
+  slice_max(order_by = average_reads, n = 1)
+
+junction_summary <- average_reads %>%
+  group_by(acceptor, donor) %>%
+  summarize(
+    min_avg_reads = min(average_reads),
+    mean_avg_reads = mean(average_reads),
+    max_avg_reads = max(average_reads),
+    max_tissue = tissue[which.max(average_reads)]
+  )
+
+
+
+
+write.csv(junction_summary, "E:/splicing junctions/GTEx_V8/junction_reads_summary_new.csv", row.names = F)
+
+write.csv(average_reads, "E:/splicing junctions/GTEx_V8/junction_reads_full_new.csv", row.names = F)
+
+write.csv(detection, "E:/splicing junctions/GTEx_V8/detection_rates_full_new.csv", row.names = F)
+
+write.csv(max_detection_rows, "E:/splicing junctions/GTEx_V8/highest_detection_new.csv", row.names = F)
+
+
+```
