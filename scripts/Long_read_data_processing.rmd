@@ -2,6 +2,9 @@
 title: "Long-read data processing for CLN3"
 output: html_notebook
 ---
+
+
+
 ```{r}
 library(dplyr)
 
@@ -28,6 +31,23 @@ quanti_tissue$organ <- gsub(".tsv", "", quanti_tissue$organ)
 organ_info <- quanti_tissue %>%
   dplyr::select(Biosample.term.name, organ) %>%
   unique()
+
+
+tissue <- metadata_tsv %>% 
+  filter(Biosample.type == "tissue") %>%
+  dplyr::select(Experiment.accession, Donor.s., Biosample.term.name)
+
+donor <- read.table("E:/Encode_tsv/donor_info.tsv", header = T)
+
+tissue$sumamry <- donor$Biosample.summary[match(tissue$Experiment.accession, donor$Accession)]
+tissue$gender <- donor$gender[match(tissue$Experiment.accession, donor$Accession)]
+
+test <- tissue %>% 
+  dplyr::select(Donor.s., gender) %>%
+  unique()
+
+#19 tissue donors
+#14 female and 5 male
 
 ```
 
@@ -115,6 +135,8 @@ fusion_id <- unique(fusion_trans$ID)
 
 #cln3_trans <- subsetByOverlaps(gtf_trans, cln3_region, type = "within")
 cln3_trans <- gtf_trans[!(elementMetadata(gtf_trans)[, "ID"] %in% fusion_id)]
+
+cln3_id <- unique(cln3_trans$ID)
 
 
 gtf_tibble <- rtracklayer::import("E:/Encode_annotation/all/CLN3_locus_unique_exons_ranked.gtf") %>% as_tibble()
@@ -211,6 +233,7 @@ f <- list()
 
 setwd("E:/Encode_tsv/all/")
 
+
 #select previously identified CLN3 transcripts and calculate their usage
 for (i in 1:length(quantification)) {
   f[[i]] <- read.table(quantification[i], sep = '\t', header = TRUE)
@@ -219,8 +242,8 @@ for (i in 1:length(quantification)) {
   
   if (nrow(f[[i]]) != 0) {
     f[[i]]$sample <- colnames(f[[i]])[12]
-    colnames(f[[i]])[12] <- 'TPM'
-    f[[i]]$proportion <- f[[i]]$TPM / sum(f[[i]]$TPM)
+    colnames(f[[i]])[12] <- 'read_counts'
+    f[[i]]$proportion <- f[[i]]$read_counts / sum(f[[i]]$read_counts)
     colnames(f[[i]])[14] <- paste('proportion', f[[i]]$sample[1])
     f[[i]]$file <- quantification[i]
   }
@@ -239,17 +262,90 @@ quanti_info$organ <- quanti_tissue$organ[match(quanti_info$file, quanti_tissue$F
 
 #write.csv(quanti_info,file = "E:/Encode_tsv/all/locus_CLN3_only.csv",row.names = F)
 
+#quanti_info <- read.csv(file = "E:/Encode_tsv/all/locus_CLN3_only.csv")
+```
 
-quanti_info <- read.csv(file = "E:/Encode_tsv/all/locus_CLN3_only.csv")
 
-sample_depth <- quanti_info %>%
-  dplyr::select(sample, TPM) %>%
-  group_by(sample) %>%
-  summarise(across(TPM, sum))
+```{r}
+#get gene length
 
-sample_depth <- separate(sample_depth, sample, into = c("replica", "Experiment.accession"), sep = "(?=[E][N])", remove = FALSE, fill = "right")
+gencode <- import("E:/reference_for_APTARS/gencode.v29.annotation.gtf") %>%
+  as_tibble()
 
-sample_depth$Biosample.term.name <- quanti_tissue$Biosample.term.name[match(sample_depth$Experiment.accession, quanti_tissue$Experiment.accession)]
+gencode_gene <- gencode %>% filter(type == "gene")
+
+#get TPM for genes
+#spike-ins removed
+#'Antisense' and 'Intergenic' genes removed
+f <- list()
+
+setwd("E:/Encode_tsv/all/")
+for (i in 1:length(quantification)) {
+  df <- read.table(quantification[i], sep = '\t', header = TRUE)
+  
+  df <- df %>% filter(transcript_novelty != "Genomic")
+  colnames(df)[12] <- "read_counts"
+  
+  df$annot_gene_id <- ifelse(df$annot_transcript_id %in% cln3_id, "ENSG00000188603.19", 
+                               ifelse(df$annot_transcript_id %in% fusion_id, "ENSG00000261832.6", df$annot_gene_id))
+  
+  df <- df %>% 
+    filter(gene_novelty == "Known")
+  
+  df_gencode <- df %>% 
+    filter(annot_gene_id %in% gencode_gene$gene_id)
+  
+  df_gencode$gene_length <- gencode_gene$width[match(df_gencode$annot_gene_id, gencode_gene$gene_id)]
+
+  df_mis <- df %>% filter(!annot_gene_id %in% gencode_gene$gene_id)
+  
+  #remove spike-ins
+  df_mis <- df_mis %>%
+    filter(!grepl("Spikein", annot_gene_id))
+  
+  dup_id <- df_mis$annot_gene_id[duplicated(df_mis$annot_gene_id)]
+  dup <- df_mis %>% 
+    filter(annot_gene_id %in% dup_id) %>% 
+    group_by(annot_gene_id) %>%
+    summarise(gene_length = max(length))
+  
+  df_mis$gene_length <- dup$gene_length[match(df_mis$annot_gene_id, dup$annot_gene_id)]
+  df_mis$gene_length <- ifelse(df_mis$annot_gene_id %in% dup$annot_gene_id, df_mis$gene_length, df_mis$length)
+
+  df <- bind_rows(df_gencode, df_mis)
+  df <- df %>% 
+    dplyr::select(annot_gene_id, read_counts, gene_length)
+  df <- df %>%
+    group_by(annot_gene_id, gene_length) %>%
+    summarise(read_counts = sum(read_counts))
+    
+  
+  df$length_kb <- df$gene_length / 1000
+  df$rpk <- df$read_counts / df$length_kb
+  total <- sum(df$rpk)
+  df$TPM <- (df$rpk / total) * 1e6
+  df <- df %>% dplyr::select(-c(length_kb, rpk))
+  df$file <- gsub(".tsv", "", as.character(quantification[[i]]))
+  
+  f[[i]] <- df
+}
+
+gene_quanti <- bind_rows(f)
+#write.csv(gene_quanti, "E:/Encode_tsv/all/gene_quanti.csv", row.names = F)
+
+
+#gene_quanti <- read.csv("E:/Encode_tsv/all/gene_quanti.csv", header = T)
+
+#select genes of interest
+
+sample_depth <- gene_quanti %>% filter(annot_gene_id %in% c("ENSG00000188603.19", "ENSG00000261832.6"))
+
+#write.csv(sample_depth, "E:/Encode_tsv/all/cln3_and_readthrough_tpm.csv", row.names = F)
+
+
+
+
+sample_depth$Biosample.term.name <- quanti_tissue$Biosample.term.name[match(sample_depth$file, quanti_tissue$File.accession)]
 
 organs <- unique(quanti_tissue$organ)
 organ_depth <- list()
@@ -265,66 +361,43 @@ for (i in 1:length(organs)) {
 
 sample_depth <- bind_rows(organ_depth)
 
+sample_depth_cln3 <- sample_depth %>% 
+  filter(annot_gene_id == "ENSG00000188603.19")
+
+sample_depth_cln3$gene <- "CLN3"
+
 #summarise CLN3 TPM for each organ
-sample_info <- sample_depth %>%
+sample_info <- sample_depth_cln3 %>%
   group_by(organ) %>%
   summarize(
     TPM_mean = mean(TPM),
     TPM_median = median(TPM),
     TPM_max = max(TPM),
     TPM_min = min(TPM),
+    reads_mean = mean(read_counts),
+    reads_median = median(read_counts),
+    reads_max = max(read_counts),
+    reads_min = min(read_counts),
     num_samples = n(),
     tissues = paste(unique(Biosample.term.name), collapse = ', ')
   )
 
-sample_info <- sample_info %>% 
-  dplyr::select(
-    organs = organ,
-    num_samples,
-    tissues,
-    TPM_mean,
-    TPM_min,
-    TPM_median,
-    TPM_max
-  )
 
 sample_info
 
-#write.csv(sample_info, "C:/Users/Haoyu/Desktop/output/manuscript/Tables/CLN3_TPM_summary_in_organs.csv", row.names = F)
+#write.csv(sample_info, "C:/Users/Haoyu/Desktop/output/manuscript/Tables/CLN3_TPM_reads_summary_in_organs.csv", row.names = F)
 
 ```
 
 Check TPM for each organs for the readthrough gene
 ```{r}
-sample_depth_cln3 <- sample_depth
-sample_depth_cln3$gene <- "CLN3"
 
-quanti_info_fusion <- read.csv(file = "E:/Encode_tsv/all/locus_fusion_only.csv")
-
-sample_depth_fusion <- quanti_info_fusion %>%
-  dplyr::select(sample, TPM) %>%
-  group_by(sample) %>%
-  summarise(across(TPM, sum))
-
-sample_depth_fusion <- separate(sample_depth_fusion, sample, into = c("replica", "Experiment.accession"), sep = "(?=[E][N])", remove = FALSE, fill = "right")
-
-sample_depth_fusion$Biosample.term.name <- quanti_tissue$Biosample.term.name[match(sample_depth_fusion$Experiment.accession, quanti_tissue$Experiment.accession)]
-
-organs <- unique(quanti_tissue$organ)
-organ_depth <- list()
+sample_depth_fusion <- sample_depth %>%
+  filter(annot_gene_id == "ENSG00000261832.6")
 
 
-#make separate rows for same tissues in different organs
-for (i in 1:length(organs)) {
-  tissues <- quanti_tissue %>% filter(organ == organs[i])
-  df <- sample_depth_fusion %>% dplyr::filter(Biosample.term.name %in% tissues$Biosample.term.name)
-  df$organ <- organs[i]
-  organ_depth[[i]] <- df
-}
 
-sample_depth_fusion <- bind_rows(organ_depth)
-
-sample_depth_fusion$gene <- "CLN3_readthrough"
+sample_depth_fusion$gene <- "CLN3-NPIPB7 readthrough"
 
 
 sample_info_fusion <- sample_depth_fusion %>%
@@ -334,23 +407,17 @@ sample_info_fusion <- sample_depth_fusion %>%
     TPM_median = median(TPM),
     TPM_max = max(TPM),
     TPM_min = min(TPM),
+    reads_mean = mean(read_counts),
+    reads_median = median(read_counts),
+    reads_max = max(read_counts),
+    reads_min = min(read_counts),
     num_samples = n(),
     tissues = paste(unique(Biosample.term.name), collapse = ', ')
   )
 
-sample_info_fusion <- sample_info_fusion %>% 
-  dplyr::select(
-    organs = organ,
-    num_samples,
-    #tissues,
-    TPM_mean,
-    TPM_min,
-    TPM_median,
-    TPM_max
-  )
 
 sample_info_fusion
-#write.csv(sample_info_fusion, "C:/Users/Haoyu/Desktop/output/manuscript/Tables/fusion_TPM_summary_in_organs.csv", row.names = F)
+#write.csv(sample_info_fusion, "C:/Users/Haoyu/Desktop/output/manuscript/Tables/fusion_TPM_reads_summary_in_organs.csv", row.names = F)
 ```
 
 
@@ -382,7 +449,7 @@ cln3_cds <- data.frame(annot_transcript_id = names(cds), cds_sequence = paste(cd
 
 
 # Merge quanti_cds with cln3_cds based on annot_transcript_id
-quanti_cds <- quanti_info %>% dplyr::select(-c('TPM', 'sample'))
+quanti_cds <- quanti_info %>% dplyr::select(-c('read_counts', 'sample'))
 #quanti_cds <- merge(quanti_cds, cln3_cds, by = 'annot_transcript_id')
 
 quanti_cds <- left_join(quanti_cds, cln3_cds, by = 'annot_transcript_id')
@@ -405,6 +472,7 @@ quanti_cds <- merge(quanti_cds, cln3_cds, by = "cds_sequence")
 
 #>Three TALON transcripts do not have CDSs: "ENCLB355PRNT000225296" "ENCLB493RCQT000258103" "ENCLB611DPFT000257989"
 #>They were removed when generating quanti_cds, number of transcripts went from 1998 to 1995 after this step
+#>keep them and state 'No_ORF'
 
 #write.csv(cln3_cds_genomic, "C:/Users/Haoyu/Desktop/output/manuscript/Tables/genomic_transcripts_cds.csv", row.names = F)
 #There are 99 'Genomic' transcripts for locus selected CLN3 transcripts.
@@ -897,6 +965,7 @@ info$new_id <- ifelse(info$orf_id == "CLN3_280_No_ORF", paste0(info$new_id, "_",
 
 ```
 
+
 ```{r}
 # Assign new UTR IDs
 five_novelty$five_id <- info$five_id[match(five_novelty$group_name, info$annot_transcript_id)]
@@ -982,6 +1051,8 @@ trans_merged_filtered <- trans_merged_quanti %>%
 trans_merged_filtered$transcript_novelty <- merged_transcript_novelty$merged_novelty[match(trans_merged_filtered$new_id, merged_transcript_novelty$new_id)]
 
 ```
+
+
 
 ```{r}
 # Replace 0 with NA
@@ -1618,6 +1689,8 @@ five_ts$occurrence <- five_occur$occurrence[match(five_ts$five_id, five_occur$fi
 
 utr_ts_info <- five_ts %>% filter(ts == TRUE) %>% group_by(five_id) %>% group_split()
 
+
+if(length(utr_ts_info) > 0 ){
 ts_list <- list()
 for (i in 1:length(utr_ts_info)){
   
@@ -1630,7 +1703,7 @@ for (i in 1:length(utr_ts_info)){
 utr_ts_info <- bind_rows(ts_list)
 
 utr_ts_info$organ <- organ_info$organ_new[match(utr_ts_info$tissue, organ_info$Biosample.term.name)]
-
+}
 
 
 five_occur$ts <- five_ts$ts[match(five_occur$five_id, five_ts$five_id)]
@@ -1734,7 +1807,7 @@ five_full <- bind_rows(five_ts,five_prop_mis)
                                    five_heat + 
                                      theme(axis.title.y = element_blank(), 
                                            axis.text.y = element_blank(),
-                                           legend.position = "none"
+                                           legend.position = "right"
                                            ), 
                    nrow=1,labels= NA, rel_widths = c(3.5, 5), align = 'h', axis = "bt")
 
@@ -1819,6 +1892,7 @@ three_ts$occurrence <- three_occur$occurrence[match(three_ts$three_id, three_occ
 
 utr_ts_info <- three_ts %>% filter(ts == TRUE) %>% group_by(three_id) %>% group_split()
 
+if(length(utr_ts_info) > 0 ){
 ts_list <- list()
 for (i in 1:length(utr_ts_info)){
   
@@ -1832,6 +1906,7 @@ utr_ts_info <- bind_rows(ts_list)
 
 utr_ts_info$organ <- organ_info$organ_new[match(utr_ts_info$tissue, organ_info$Biosample.term.name)]
 
+}
 
 
 three_occur$ts <- three_ts$ts[match(three_occur$three_id, three_ts$three_id)]
@@ -1947,8 +2022,11 @@ return(utr_ts_info)
 
 }
 
-#plot_utr("CLN3_235_181aa", 3)
-#info_181 <- utr_ts_info
+
+
+#plot_utr("CLN3_24_438aa", 3)
+
+#utr_ts_plot
 ```
 
 ```{r}
