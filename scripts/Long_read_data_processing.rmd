@@ -1220,7 +1220,7 @@ sum_df <- data.frame(variable = names(column_sums), sum_value = column_sums)
 orf_prop <- orf_prop %>% group_by(orf_id) %>% summarise_all(sum)
 
 # Check occurrence of ORFs
-orf_prop$occurrence <- rowSums(orf_prop[, 2:(1+length(grep('rep', colnames(trans_merged_quanti))))] != 0)
+orf_prop$occurrence <- rowSums(orf_prop[, 2:(1+length(grep('rep', colnames(orf_prop))))] != 0)
 
 orf_prop_long <- reshape2::melt(orf_prop)
 orf_prop_long <- orf_prop_long %>% dplyr::filter(variable != 'occurrence')
@@ -1228,9 +1228,11 @@ orf_prop_long$occurrence <- orf_prop$occurrence[match(orf_prop_long$orf_id, orf_
 
 orf_prop_long[orf_prop_long == 0] <- NA
 orf_prop_long <- na.omit(orf_prop_long)
+```
+
 
 #Examine major transcripts
-
+```{r}
 major <- orf_prop_long %>% filter(orf_id == "CLN3_235_181aa")
 
 major <- separate(major, variable, into = c("rep_number", "experiment"), sep = "(?<=rep[1-9])", remove = FALSE)
@@ -1247,6 +1249,24 @@ cat("Valid major transcripts were detected in", n_distinct(major$tissue), " tiss
 #write.csv(major, "C:/Users/Haoyu/Desktop/output/manuscript/Tables/major_detection_summary.csv", row.names = F)
 ```
 
+Check the transcripts matching reported ASO-induced exon skipping
+```{r}
+aso <- orf_prop_long %>% filter(orf_id == "CLN3_99_339aa") 
+aso <- separate(aso, variable, into = c("rep_number", "experiment"), sep = "(?<=rep[1-9])", remove = FALSE)
+
+
+aso$tissue <- metadata_tsv$Biosample.term.name[match(aso$experiment, metadata_tsv$Experiment.accession)]
+
+aso$donor <- metadata_tsv$Donor.s.[match(aso$experiment, metadata_tsv$Experiment.accession)]
+
+aso$sumamry <- donor$Biosample.summary[match(aso$experiment, donor$Accession)]
+
+aso$value <- aso$value *100
+
+
+
+#write.csv(aso, "C:/Users/Haoyu/Desktop/output/manuscript/Tables/aso_detection_summary.csv", row.names = F)
+```
 
 
 Determine ORF novelty and summarise ORF usage
