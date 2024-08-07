@@ -223,3 +223,36 @@ full_in_rjun <- full_junc %>% filter(full_junc$junc %in% rjun$coord)
 
 rjun_in_encode <- rjun %>% filter(coord %in% full_in_rjun$junc)
 
+
+#use SpliceVault data
+splicevault <- read.table(file="E:/splicing junctions/splicevault/splicevault_subset.txt", sep = "\t")
+colnames(splicevault) <- c("splice_site_pos", "ss_type", "exon_no", "splicing_event_class", "event_rank",
+                           "in_gtex", "in_sra", "missplicing_inframe", "gtex_sample_count", "max_uniq_reads", 
+                           "sra_sample_count", "sample_count", "skipped_exons_count",
+                           "skipped_exons_id", "cryptic_distance", "chr", "donor_pos", "acceptor_pos", "gene_tx_id")
+cln3_known <- read.table(file = "E:/splicing junctions/splicevault/cln3_rows.txt", header = F, sep = "\t")
+
+#Keep only CLN3 junctions using tx ids
+splicevault_cln3 <- splicevault %>% filter(splicevault$gene_tx_id %in% cln3_known$V1)
+
+splicevault_cln3$coord <- paste(splicevault_cln3$acceptor_pos - 1, "|", splicevault_cln3$donor_pos + 1, sep = "")
+
+junc_not_in_rjun <- unique(full_not_in_rjun$junc)
+
+
+#For 17 absent junctions
+detected <- splicevault_cln3 %>% filter(coord %in% junc_not_in_rjun)
+
+
+
+full_junc_vector <- unique(full_junc$junc)
+detected_full <- splicevault_cln3 %>% filter(coord %in% full_junc_vector)
+
+full_cryptic <- detected_full %>% filter(splicing_event_class %in% c("cryptic donor", "cryptic acceptor")) %>%
+  #dplyr::select(splicing_event_class, coord) %>%
+  unique()
+
+
+full_cryptic$transcript_id <- cln3_known$V3[match(full_cryptic$gene_tx_id, cln3_known$V1)]
+
+full_cryptic <- full_cryptic %>% dplyr::select(-coord) %>% unique()
